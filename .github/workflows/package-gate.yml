@@ -1,0 +1,52 @@
+# Checks the committed package and full history on main, PRs, and calls from tag publishing.
+# Used by: pushes, pull requests, and publish.yml; all jobs use GitHub-hosted execution.
+# Uses: .release/check.mjs, git, gitleaks pinned below and verified by Go's checksum database.
+# Needs: HARNESS_DENYLIST as a repository Actions secret (never a variable); forks receive none.
+# Fork PRs run this fork's own workflow and .release/check.mjs, so their green gate is not evidence; the push to main is the backstop.
+name: Package gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+    secrets:
+      HARNESS_DENYLIST:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: Package gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: lts/*
+      - name: Install gitleaks
+        # Pin the module; the checksum database verifies source and transitive dependencies.
+        # Explicit settings prevent an ambient Go configuration disabling verification.
+        env:
+          GOSUMDB: sum.golang.org
+          GOPRIVATE: ""
+          GONOSUMDB: ""
+          GOTOOLCHAIN: local
+        run: |
+          go install github.com/zricethezav/gitleaks/v8@v8.28.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Full package gate
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          HARNESS_DENYLIST: ${{ secrets.HARNESS_DENYLIST }}
+        run: node .release/check.mjs
+      # Separate steps ensure a fork-triggered gate never receives the private list.
+      - name: Fork package gate (private terms skipped)
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        run: node .release/check.mjs --fork-pr

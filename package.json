@@ -1,0 +1,21 @@
+{
+  "name": "merge-conveyor",
+  "version": "0.1.0",
+  "description": "An unattended merge timer for GitHub repos: merges cleared, tested PRs one at a time.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "FSL-1.1-MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bretperry/conveyor"
+  },
+  "exports": "./src/index.mjs",
+  "files": [
+    "src/"
+  ],
+  "scripts": {
+    "test": "node --test"
+  }
+}

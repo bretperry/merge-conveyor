@@ -1,0 +1,87 @@
+# Publishes merge-conveyor to npm, with provenance, when a v* tag is pushed. Nothing else publishes.
+# Trigger: a tag push only. No branch push, pull request, schedule, or manual run starts it.
+# Needs: NPM_TOKEN (an npm automation token scoped to this package) as a secret of the `publish` Environment, not a repository secret:
+#   Settings > Environments > publish, with the owner as a required reviewer, so a tag push waits for a click before the token is released.
+# Needs: HARNESS_DENYLIST as a repository Actions secret for the required tag gate; an absent list fails.
+#   Also package.json with a `test` script, a `version`, and a `repository` that matches this repo (provenance checks it).
+# Tag ruleset: also set one for `v*` (Settings > Rules > Rulesets > target: tags) so only the owner can create, move or delete a release tag.
+# Tag rule: the tag must be v<version> exactly, where <version> is package.json's version.
+# Actions are pinned to full commit SHAs; the comment after each says the release it is. Update them by hand, reading the release first.
+
+name: Publish
+
+on:
+  push:
+    tags: ["v*"]
+
+# No default token power; each job asks for what it needs.
+permissions: {}
+
+# One publish per tag at a time, and never cancel one mid-publish.
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    uses: ./.github/workflows/package-gate.yml
+    permissions:
+      contents: read
+    secrets:
+      HARNESS_DENYLIST: ${{ secrets.HARNESS_DENYLIST }}
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: lts/*
+      - name: Tag matches package.json
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          version="$(node -p "require('./package.json').version")"
+          if [ "$GITHUB_REF" != "refs/tags/$tag" ] || [ "$tag" != "v$version" ]; then
+            echo "Refusing: ref '$GITHUB_REF' is not the tag v$version (package.json version)." >&2
+            exit 1
+          fi
+      - name: Install
+        run: |
+          if [ -f package-lock.json ]; then npm ci --ignore-scripts; fi
+      - name: Test
+        run: npm test
+
+  publish:
+    name: Publish
+    needs: [test, gate]
+    # Belt and braces: the trigger already limits this to tags.
+    if: startsWith(github.ref, 'refs/tags/v')
+    # The npm token lives in this Environment; its required reviewer must approve before this job starts.
+    environment: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: lts/*
+          registry-url: https://registry.npmjs.org
+      # No lifecycle script (install, prepare, prepublishOnly) runs with the token in reach: the install and the publish both skip scripts.
+      - name: Install
+        run: |
+          if [ -f package-lock.json ]; then npm ci --ignore-scripts; fi
+      - name: Publish with provenance
+        run: npm publish --provenance --ignore-scripts --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
