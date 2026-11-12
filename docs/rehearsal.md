@@ -18,12 +18,12 @@ Each timing includes process startup and JSON output. The simulated GitHub shim 
 | Help | 20 | p95 41 ms | 0 GitHub, 0 Git | Within 250 ms |
 | Version | 20 | p95 39 ms | 0 GitHub, 0 Git | Within 250 ms |
 | Queue, 4 cleared and 16 awaiting clearance | 20 | p95 4.39 s | 37 GitHub, 13 Git | Complete 20-entry snapshot and known next action in every run |
-| Queue, 20 cleared | 10 | p95 15.06 s | 105 GitHub, plus local Git | Missed 5 s. Every run returned a partial snapshot with the already verified first action. |
-| Queue, delayed second page | 1 | 15.04 s | 2 GitHub, plus local Git | Partial snapshot retained PR #7 with `read_timeout` and unknown next action |
-| Explain #7, delayed second page | 1 | 15.05 s | 2 GitHub, plus local Git | Partial result retained PR #7 with `read_timeout` and unknown next action |
+| Queue, 20 cleared | 20 | p95 15.08 s | 129–133 GitHub, 13 Git | Missed 5 s. 16 partial and 4 complete snapshots, all with the verified first action. |
+| Queue, delayed second page | 1 | 15.06 s | 2 GitHub, 3 Git | Partial snapshot retained PR #7 with `read_timeout` and unknown next action |
+| Explain #7, delayed second page | 1 | 15.07 s | 2 GitHub, 3 Git | Partial result retained PR #7 with `read_timeout` and unknown next action |
 | Queue, 25 cleared, zero shim delay | 1 | 0.67 s | 147 GitHub, 13 Git | Stopped at 160 commands. Snapshot marked incomplete, with the already verified first action. |
 
-The 20-cleared stress and delayed-page timings above used a Python shim with additional process startup overhead. A lower-overhead native shim still took about 15 s with 20 cleared PRs and reached 133 GitHub calls. The 5 s target holds for the measured mixed queue with the native shim. A higher fraction of cleared PRs adds serial evidence reads and exceeds the target.
+The measurements above used a native shim to keep process startup overhead low. The mixed queue met the 5 s target. A higher fraction of cleared PRs adds serial evidence reads and can reach the 15 s read budget.
 
 ## Protected repository rehearsal
 
