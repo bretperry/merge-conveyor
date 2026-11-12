@@ -4,6 +4,8 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
+
+import { isSha, parseJson } from "./github.mjs";
 // The common git dir, so a worktree and its primary clone share one log.
 const gitDir = (run, cwd) => {
   const result = run(["git", "-C", cwd, "rev-parse", "--git-common-dir"]);
@@ -67,7 +69,26 @@ const prFiles = (pr, run) => {
   }
 };
 
-export const createApprovals = ({ HOLD_PATTERNS, MAX_PR_FILES, heldBy, pathsHeld, approvalsLog = "conveyor-approvals.log" }) => {
+// Count each page against the standalone client's request budget. A capped file
+// list cannot establish that all held paths were checked.
+const boundedFiles = (pr, run, limit) => {
+  const files = [];
+  for (let page = 1; files.length < limit; page += 1) {
+    const response = run(["gh", "api", `repos/{owner}/{repo}/pulls/${pr}/files?per_page=100&page=${page}`]);
+    const rows = response.status === 0 ? parseJson(response.stdout) : null;
+    if (!Array.isArray(rows) || rows.length > 100) return null;
+    for (const row of rows) {
+      if (typeof row?.filename !== "string" || !row.filename || !isSha(row.sha) ||
+        !["added", "removed", "modified", "renamed", "copied", "changed", "unchanged"].includes(row.status) ||
+        (row.status === "renamed" && (typeof row.previous_filename !== "string" || !row.previous_filename))) return null;
+      files.push({ path: row.filename, status: row.status, sha: row.sha, previous: row.previous_filename, ref: listedAt(row.contents_url) });
+    }
+    if (rows.length < 100) break;
+  }
+  return new Set(files.map((file) => file.path)).size === files.length ? files : null;
+};
+
+export const createApprovals = ({ HOLD_PATTERNS, MAX_PR_FILES, heldBy, pathsHeld, approvalsLog = "conveyor-approvals.log", boundedReads = false }) => {
   // Knobs: how long a yes lasts, and the log's name in the common git dir.
   const APPROVAL_HOURS = 24;
   const APPROVALS_LOG = approvalsLog;
@@ -121,7 +142,7 @@ export const createApprovals = ({ HOLD_PATTERNS, MAX_PR_FILES, heldBy, pathsHeld
   const readHeld = (pr, run, { allModes = false } = {}) => {
     const before = headOf(pr, run);
     if (before.error) return before;
-    const files = prFiles(pr, run);
+    const files = boundedReads ? boundedFiles(pr, run, MAX_PR_FILES) : prFiles(pr, run);
     if (files === null) return { error: `can't read #${pr}'s changed files` };
     // A PR changes at least one file; an empty list under a good status is a read that lost its entries, and no held path was ruled out by it.
     if (files.length === 0) return { error: `#${pr}'s changed files came back empty, so no held path was ruled out` };
