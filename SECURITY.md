@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Report it privately: open <https://github.com/bretperry/conveyor/security/advisories/new>.
+Report it privately: open <https://github.com/bretperry/merge-conveyor/security/advisories/new>.
 Do not open a public issue for a vulnerability.
 
 Include what you ran, what you expected, and what happened. A reproduction helps most.

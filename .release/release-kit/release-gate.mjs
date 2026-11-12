@@ -219,6 +219,9 @@ const APPROVED_FAMILY_URL_FINGERPRINTS = new Set([
   "05bb3bfa6e84485ddfec76cb323053de1cc1cde64e516efd8657f7d60be08ca1",
   "4f65d74bfe164aee7a8040b1c036dfefbcf62a56d858ccd042e267b10a627dbb",
   "6f6f75de36c714e4e8b6239d89bcbd2b1c0a2237e8a6761a3f695ce14eada72c",
+  "edd67fa590150f8b20533938308482f8b69437c82420d2805d4252abb373ef8a",
+  "7508b3f32f00ea9f133aa8012f268306ef099c7793a42bbaea67f3d03aed100b",
+  "11dabefd36802fabc22f63f63b0afadbd6606415089f6d9cb3bc55b86b86a1dc",
 ]);
 const APPROVED_IDENTITY_EMAIL_FINGERPRINT = "edf66de584f8889227f518d4c4e2a20e679a40e77f401af4091956d7fc8dae53";
 // The default GitHub subject of the Phase 1 merge contains the login. Preserve the stored history.
