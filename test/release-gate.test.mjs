@@ -1,4 +1,4 @@
-// Exercises the release gate's identity policy against throwaway Git objects and fictional identities.
+// Exercises release gate exceptions against throwaway Git objects and fictional identities.
 // Run: node --test test/release-gate.test.mjs. Uses Git and a stub for the independent secret scan.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -10,7 +10,7 @@ import { test } from "node:test";
 
 import { parseTerms } from "../.release/lib/publish-terms.mjs";
 import { KIT_FILES, LICENSE_PATH, renderKitFile } from "../.release/release-kit/kit.mjs";
-import { createGateForTesting, formatReport } from "../.release/release-kit/release-gate.mjs";
+import { createGateForTesting, formatReport, PATH_TERMS } from "../.release/release-kit/release-gate.mjs";
 
 const LICENSOR = "Alex Quillfeather";
 const YEAR = "2026";
@@ -47,20 +47,22 @@ const fixture = (t, approvedEmail = EMAIL) => {
   git(["add", "--all"]);
   git(["commit", "-qm", "Initial commit"]);
 
-  const gate = createGateForTesting({
-    familyUrlFingerprints: new Set([fingerprint("https://example.test/project")]),
-    identityEmailFingerprint: fingerprint(approvedEmail),
-  });
-  const check = (where, count = 1) => {
+  const check = (where, { count = 1, commitSubjectException, step = "terms" } = {}) => {
+    const gate = createGateForTesting({
+      familyUrlFingerprints: new Set([fingerprint("https://example.test/project")]),
+      identityEmailFingerprint: fingerprint(approvedEmail),
+      commitSubjectException,
+    });
     const saved = process.env.PATH;
     process.env.PATH = [bin, saved].join(delimiter);
     try {
       const result = gate({ dir: repo, terms: TERMS, licensor: LICENSOR, year: YEAR });
       const report = formatReport(result).join("\n");
-      assert.deepEqual(result.steps.filter(({ ok }) => !ok).map(({ name }) => name), where ? ["terms"] : [], report);
+      assert.deepEqual(result.steps.filter(({ ok }) => !ok).map(({ name }) => name), where ? [step] : [], report);
       if (where) {
-        const lines = result.steps.find(({ name }) => name === "terms").lines;
+        const lines = result.steps.find(({ name }) => name === step).lines;
         assert.ok(lines.filter((line) => where.test(line)).length >= count, report);
+        return lines;
       }
     } finally {
       process.env.PATH = saved;
@@ -84,7 +86,7 @@ test("the release gate requires the exact login spelling and fingerprint-matched
     await t.test(label, (subtest) => {
       const { commit, check } = fixture(subtest);
       commit(name, email);
-      check(/commit metadata/u, 2);
+      check(/commit metadata/u, { count: 2 });
     });
   }
 });
@@ -95,7 +97,7 @@ test("the release gate requires the ID-plus-login GitHub noreply email form for 
   commit(LICENSOR, legacyEmail);
   check();
   commit(LOGIN, legacyEmail);
-  check(/commit metadata/u, 2);
+  check(/commit metadata/u, { count: 2 });
 });
 
 test("the release gate scans an identity lookalike in a commit message", (t) => {
@@ -130,7 +132,37 @@ test("the release gate scans both occurrences of a duplicate identity header", a
       const duplicate = raw.replace(`${line}\n`, `${line}\n${line}\n`);
       const oid = git(["hash-object", "--literally", "-t", "commit", "-w", "--stdin"], { input: `${duplicate}\n` });
       git(["update-ref", "HEAD", oid]);
-      check(/commit metadata/u, 2);
+      check(/commit metadata/u, { count: 2 });
     });
   }
+});
+
+test("the release gate requires both the exact commit and the exact subject fingerprint", (t) => {
+  const { git, commit, check } = fixture(t);
+  const subject = `Merge pull request from ${LOGIN}/example`;
+  commit(LICENSOR, EMAIL, subject);
+  const oid = git(["rev-parse", "HEAD"]);
+  const commitSubjectException = { oid, fingerprint: fingerprint(subject) };
+  check(undefined, { commitSubjectException });
+  check(/commit message:1/u, { commitSubjectException: { oid, fingerprint: fingerprint(subject.toUpperCase()) } });
+
+  commit(LICENSOR, EMAIL, subject);
+  check(/commit message:1/u, { commitSubjectException });
+});
+
+test("the release gate still scans the same text later in the approved commit message", (t) => {
+  const { git, commit, check } = fixture(t);
+  const subject = `Merge pull request from ${LOGIN}/example`;
+  commit(LICENSOR, EMAIL, `${subject}\n\n${subject}`);
+  const commitSubjectException = { oid: git(["rev-parse", "HEAD"]), fingerprint: fingerprint(subject) };
+  const lines = check(/commit message:3/u, { commitSubjectException });
+  assert.deepEqual(lines, ["content commit message:3 matches term #2"]);
+});
+
+test("the release gate still checks the approved subject for home paths", (t) => {
+  const { git, commit, check } = fixture(t);
+  const subject = `${LOGIN} ${PATH_TERMS[0]}/example`;
+  commit(LICENSOR, EMAIL, subject);
+  const commitSubjectException = { oid: git(["rev-parse", "HEAD"]), fingerprint: fingerprint(subject) };
+  check(/commit message:1/u, { commitSubjectException, step: "paths" });
 });
