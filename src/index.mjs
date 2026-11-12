@@ -44,6 +44,7 @@ const validateConfig = (config) => {
   ensure(config.clearancePublisherId === undefined || (Number.isSafeInteger(config.clearancePublisherId) && config.clearancePublisherId > 0), "clearancePublisherId", "a positive GitHub user ID");
   object(config.release, "release");
   string(config.release.branch, "release.branch");
+  ensure(config.base !== config.release.branch, "base", "different from release.branch");
   object(config.ageAlarms, "ageAlarms");
   for (const field of ["pokeHours", "tellHours"]) {
     ensure(Number.isFinite(config.ageAlarms[field]) && config.ageAlarms[field] >= 0, `ageAlarms.${field}`, "a finite nonnegative number");
@@ -100,8 +101,6 @@ export const createConveyor = (config) => {
   const STATE_NAME = `${config.stateName}.json`;
   const LOG_NAME = `${config.stateName}.log`;
   const LOCK_NAME = `${config.stateName}.lock`;
-  // A commit GitHub starts no run for; the same markers the guard reads.
-  const SKIPS_CI = /\[(skip ci|ci skip|no ci|skip actions|actions skip)\]|skip-checks:\s*true/i;
   // `tick`'s code once it has alarmed, so the shell wrapper only reports a tick that couldn't.
   const REPORTED = 3;
 
@@ -182,8 +181,7 @@ export const createConveyor = (config) => {
     return result.status === 0 && isSha(sha) ? { sha } : { error: `can't read ${BASE_BRANCH}'s tip: ${result.stderr.trim() || "bad output"}` };
   };
 
-  // Whether `dev` is green now: its CI workflow's last push run succeeded, at the tip or with only
-  // skip-ci commits above it. No run reads as not green: a dev that never runs CI can't say it's green.
+  // Only a successful push run on the current base tip qualifies. A commit message is not CI evidence.
   const devState = (run) => {
     const result = run(["gh", "run", "list", "--branch", BASE_BRANCH, "--event", "push", "--workflow", DEV_WORKFLOW, "--limit", "1", "--json", "status,conclusion,headSha"]);
     const runs = result.status === 0 ? parseJson(result.stdout) : null;
@@ -196,13 +194,6 @@ export const createConveyor = (config) => {
     const tip = devTip(run);
     if (tip.error) return { green: false, unreadable: true, why: tip.error };
     if (tip.sha === last.headSha) return { green: true, sha: tip.sha };
-    const compare = run(["gh", "api", `repos/{owner}/{repo}/compare/${last.headSha}...${tip.sha}`, "--jq", "[.status, .ahead_by, [.commits[].commit.message]]"]);
-    const read = compare.status === 0 ? parseJson(compare.stdout) : null;
-    if (!Array.isArray(read) || !Array.isArray(read[2]) || read[2].some((message) => typeof message !== "string")) {
-      return { green: false, unreadable: true, why: `can't compare ${BASE_BRANCH}'s tip with its last run` };
-    }
-    const [status, ahead, messages] = read;
-    if (status === "ahead" && ahead > 0 && ahead === messages.length && messages.every((message) => SKIPS_CI.test(message))) return { green: true, sha: tip.sha };
     return { green: false, why: `${BASE_BRANCH}'s tip ${short(tip.sha)} has no finished ${DEV_WORKFLOW} run yet` };
   };
 
@@ -366,16 +357,17 @@ export const createConveyor = (config) => {
     if (!hasStrictChecks(run, BASE_BRANCH)) return `can't verify strict required checks on ${BASE_BRANCH}`;
     const held = heldState(pr, run);
     if (held.error) return held.error;
+    const clearance = clearanceProblem(pr.head, run);
+    if (clearance) return clearance;
+    const switchNow = readSwitch(run);
+    if (!switchNow.on) return switchNow.why;
+    // Read the exact target last because the write API only pins the head.
     const live = readPull(run, pr.number, ["baseRefOid", "isDraft", "mergeable", "mergeStateStatus", "isCrossRepository", "statusCheckRollup"]);
     if (!live || live.state !== "OPEN" || live.baseRefName !== BASE_BRANCH || live.headRefOid !== pr.head || live.baseRefOid !== baseSha) return `#${pr.number}'s head or base changed or could not be verified`;
     if (classify(live).kind !== "cleared") return `#${pr.number}'s clearance, CI or mergeability changed`;
     if (kind === "merge" && live.mergeStateStatus !== "CLEAN") return `GitHub does not report #${pr.number} ready to merge`;
     if (kind === "update" && live.isCrossRepository !== false) return `#${pr.number} cannot be updated from this repository`;
-    const clearance = clearanceProblem(pr.head, run);
-    if (clearance) return clearance;
-    // The owner can revoke consent while the earlier reads are running.
-    const switchNow = readSwitch(run);
-    if (!switchNow.on) return switchNow.why;
+    // Consent and hold approvals can expire during any of the remote reads.
     const at = clock();
     const until = activeUntil(dir, at);
     if (!(until instanceof Date) || !(until > at)) return "commando is off";

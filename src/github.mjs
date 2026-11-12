@@ -22,17 +22,29 @@ export const readMerge = (run, number) => {
   return pr;
 };
 
+const isContext = (value) => typeof value === "string" && value.trim().length > 0;
+const isAppId = (id) => Number.isSafeInteger(id) && id > 0;
+const isRulesetCheck = (check) => isContext(check?.context) &&
+  (check.integration_id === undefined || isAppId(check.integration_id));
+const isClassicCheck = (check) => isContext(check?.context) &&
+  (check.app_id == null || check.app_id === -1 || isAppId(check.app_id));
+
 export const hasStrictChecks = (run, branch) => {
   const encoded = encodeURIComponent(branch);
   const active = run(["gh", "api", `repos/{owner}/{repo}/rules/branches/${encoded}?per_page=100`]);
   const rules = active.status === 0 ? parseJson(active.stdout) : null;
-  const configured = (contexts) => Array.isArray(contexts) && contexts.length > 0;
-  if (Array.isArray(rules) && rules.some((rule) => rule?.type === "required_status_checks" &&
-    rule.parameters?.strict_required_status_checks_policy === true && configured(rule.parameters.required_status_checks))) return true;
+  if (Array.isArray(rules) && rules.some((rule) => {
+    if (rule?.type !== "required_status_checks" || rule.parameters?.strict_required_status_checks_policy !== true) return false;
+    const checks = rule.parameters.required_status_checks;
+    return Array.isArray(checks) && checks.length > 0 && checks.every(isRulesetCheck);
+  })) return true;
   // The rules endpoint lists rulesets. Classic branch protection has a separate endpoint.
   const classic = run(["gh", "api", `repos/{owner}/{repo}/branches/${encoded}/protection/required_status_checks`]);
   const protection = classic.status === 0 ? parseJson(classic.stdout) : null;
-  return protection?.strict === true && (configured(protection.checks) || configured(protection.contexts));
+  if (protection?.strict !== true) return false;
+  const { checks = [], contexts = [] } = protection;
+  return Array.isArray(checks) && checks.every(isClassicCheck) &&
+    Array.isArray(contexts) && contexts.every(isContext) && checks.length + contexts.length > 0;
 };
 
 // GitHub enforces the head SHA and branch rules on submission. Deployment must restrict the

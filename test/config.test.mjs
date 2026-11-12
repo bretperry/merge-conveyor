@@ -51,6 +51,7 @@ test("rejects invalid config before returning a conveyor or calling adapters", (
     rejects({ ...valid, [field]: {} }, field);
   }
   for (const branch of [undefined, null, "", " ", 42]) rejects({ ...valid, release: { branch } }, "release.branch");
+  rejects({ ...valid, release: { branch: valid.base } }, "release.branch");
   for (const field of ["pokeHours", "tellHours"]) {
     for (const value of [undefined, null, "2", NaN, Infinity, -Infinity, -1]) {
       rejects({ ...valid, ageAlarms: { ...valid.ageAlarms, [field]: value } }, `ageAlarms.${field}`);

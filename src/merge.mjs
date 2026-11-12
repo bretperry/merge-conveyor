@@ -3,7 +3,7 @@
 // Exports: createMerge.
 import { latestPerCheck } from "./merge-checks.mjs";
 import { checkRows, ciVerdict } from "./ci.mjs";
-import { hasStrictChecks, isSha, MERGE_METHODS, mergePull, readMerge, readPull } from "./github.mjs";
+import { hasStrictChecks, isSha, MERGE_METHODS, mergePull, parseJson, readMerge, readPull } from "./github.mjs";
 import { spawnSync } from "node:child_process";
 import { parseArgs } from "node:util";
 // One shell-free process call; `gh`'s exit code is only a hint (see fetch and merge).
@@ -23,6 +23,20 @@ const changedPaths = (number, run) => {
   if (diff.status !== 0) return null;
   const paths = diff.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
   return paths.length > 0 ? paths : null;
+};
+
+// Compare the exact pair for a base advanced by this batch. The file list is on the first page
+// and capped at 300, so a possibly incomplete list requires every heavy check.
+const compareHead = (head, base, run) => {
+  const result = run(["gh", "api", `repos/{owner}/{repo}/compare/${base}...${head}?per_page=1`, "--jq",
+    "{status, behind_by, files: (.files // [] | map({filename, previous_filename}))}"]);
+  const comparison = result.status === 0 ? parseJson(result.stdout) : null;
+  if (comparison?.status !== "ahead" || comparison.behind_by !== 0) return null;
+  const { files } = comparison;
+  const isPath = (path) => typeof path === "string" && path.length > 0;
+  const complete = Array.isArray(files) && files.length > 0 && files.length < 300 &&
+    files.every((file) => isPath(file?.filename) && (file.previous_filename == null || isPath(file.previous_filename)));
+  return { paths: complete ? files.flatMap(({ filename, previous_filename }) => previous_filename ? [filename, previous_filename] : [filename]) : null };
 };
 
 const scopeLabel = (heavy) => (heavy.length > 0 ? heavy.join(", ") : "none (cheap checks only)");
@@ -95,8 +109,7 @@ export const createMerge = ({ loadHeavyChecks, isGateContext, base, releaseBranc
       this.heavyCache = new Map();
     }
 
-    // The ship asks for every heavy check, not the paths (see the header). Otherwise keyed by head:
-    // a new push can change the path class.
+    // The ship asks for every heavy check. Otherwise cache by both refs, which determine the diff.
     heavyFor(snap) {
       if (this.ship) return this.checks.map((check) => check.name);
       const key = `${snap.number}@${snap.head}:${snap.baseSha}`;
@@ -172,6 +185,7 @@ export const createMerge = ({ loadHeavyChecks, isGateContext, base, releaseBranc
     // Merges each pinned PR in input order after a fresh check. Returns the merged numbers.
     merge(pinned) {
       const merged = [];
+      let advance;
       for (const n of this.numbers) {
         if (!pinned.has(n)) continue;
         const { head, baseSha } = pinned.get(n);
@@ -180,11 +194,25 @@ export const createMerge = ({ loadHeavyChecks, isGateContext, base, releaseBranc
           this.out(`#${n} SKIPPED: ${stop}`);
           continue;
         }
-        const protection = hasStrictChecks(this.run, this.wantBase);
-        const { snap, reasons: why } = this.check(n);
-        if (!protection) why.unshift(`can't verify strict required checks on ${this.wantBase}`);
+        if (advance && baseSha !== advance.from) {
+          this.out(`#${n} SKIPPED: qualified on a different base than this batch`);
+          continue;
+        }
+        if (!hasStrictChecks(this.run, this.wantBase)) {
+          this.out(`#${n} SKIPPED: can't verify strict required checks on ${this.wantBase}`);
+          continue;
+        }
+        const expectedBase = advance?.to ?? baseSha;
+        const comparison = advance && compareHead(head, expectedBase, this.run);
+        if (advance && !comparison) {
+          this.out(`#${n} SKIPPED: can't verify its head contains the batch's new base ${short(expectedBase)}`);
+          continue;
+        }
+        const heavy = comparison ? requiredHeavy(comparison.paths, this.checks) : this.heavyFor({ number: n, head, baseSha });
+        const snap = fetchPr(n, this.run, this.wantBase, this.wantHead);
+        const why = verdict(snap, heavy);
         if (!snap.error && snap.head !== head) why.unshift(`head changed ${short(head)} -> ${short(snap.head)}`);
-        if (!snap.error && snap.baseSha !== baseSha) why.unshift(`base tip changed ${short(baseSha)} -> ${short(snap.baseSha)}`);
+        if (!snap.error && snap.baseSha !== expectedBase) why.unshift(`base tip changed ${short(expectedBase)} -> ${short(snap.baseSha)}`);
         if (why.length > 0) {
           this.out(`#${n} SKIPPED: ${why.join("; ")}`);
           continue;
@@ -197,6 +225,7 @@ export const createMerge = ({ loadHeavyChecks, isGateContext, base, releaseBranc
         }
         this.out(`#${n} MERGED ${short(outcome.mergeCommit.oid)}`);
         merged.push(n);
+        advance = { from: baseSha, to: outcome.mergeCommit.oid };
       }
       return merged;
     }
@@ -239,7 +268,7 @@ export const createMerge = ({ loadHeavyChecks, isGateContext, base, releaseBranc
 
   // The whole run; returns the exit code (0 all merged or dry run, 1 something didn't, 2 usage).
   // `wantHead` (programmatic only, one PR): merge only if the PR's head is still that commit.
-  // `beforeMerge` (programmatic only): called right before each `gh pr merge`; a non-empty reason skips it.
+  // `beforeMerge` (programmatic only): called before each merge preflight; a non-empty reason skips it.
   const main = async (argv, { root = process.cwd(), run = (argv) => defaultRun(argv, root), clock, sleep, out = console.log, err = console.error, wantHead = "", beforeMerge, base: featureBase = base, releaseBranch: shipBase = releaseBranch, mergeMethod: method = mergeMethod } = {}) => {
     const args = parseCli(argv);
     if (args.error) {

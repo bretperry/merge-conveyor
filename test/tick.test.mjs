@@ -39,6 +39,7 @@ const fixture = (t, config = {}) => {
     pr: ready(),
     changed: ["src/file.mjs"],
     holdApproval: false,
+    holdUntil: Infinity,
     ahead: 0,
     strict: true,
     publisherId: 100,
@@ -82,7 +83,7 @@ const fixture = (t, config = {}) => {
     clearedContext: CONTEXT, clearancePublisherId: 100, stateName: "worker", ageAlarms: { pokeHours: 2, tellHours: 4 },
     ...config,
     adapters: {
-      approved: (_dir, _now, scope) => model.holdApproval && scope.scope === "hold:migrations",
+      approved: (_dir, now, scope) => model.holdApproval && now < model.holdUntil && scope.scope === "hold:migrations",
       changeDigest: () => null,
       gitDir: () => dir,
       heldDigest: () => null,
@@ -116,6 +117,7 @@ const fixture = (t, config = {}) => {
 test("records intent before a configured direct merge and verifies GitHub after a lost response", async (t) => {
   const f = fixture(t, { mergeMethod: "rebase" });
   f.model.onWrite = (argv) => {
+    assert.deepEqual(f.model.calls.at(-2).slice(0, 4), ["gh", "pr", "view", "1"]);
     assert.deepEqual(f.state().operation, { kind: "merge", number: 1, head: HEAD, base: BASE, baseSha: BASE_SHA, at: START });
     assert.deepEqual(argv, ["gh", "api", "--method", "PUT", "repos/{owner}/{repo}/pulls/1/merge", "-f", `sha=${HEAD}`, "-f", "merge_method=rebase"]);
     f.merge();
@@ -125,6 +127,18 @@ test("records intent before a configured direct merge and verifies GitHub after 
   assert.equal(f.state().operation, undefined);
   assert.equal(f.state().lastMergeAt, START);
   assert.equal(f.model.writes.length, 1);
+});
+
+test("a skip directive on an untested base tip does not authorize a write", async (t) => {
+  const f = fixture(t);
+  f.model.baseTip = f.model.localTip = f.model.pr.baseRefOid = NEW_BASE;
+  f.model.onCall = (argv) => argv[2] === `repos/{owner}/{repo}/compare/${BASE_SHA}...${NEW_BASE}`
+    ? ok(["ahead", 1, ["Change runtime code [skip ci]"]]) : null;
+  assert.equal(await f.run("tick", "--dry-run"), 0);
+  assert.ok(f.model.lines.some((line) => line.includes("has no finished checks.yml run")));
+  await f.run("tick");
+  assert.deepEqual(f.model.writes, []);
+  assert.equal(f.state().operation, undefined);
 });
 
 test("rechecks mutable evidence at the write boundary", async (t) => {
@@ -149,6 +163,41 @@ test("rechecks mutable evidence at the write boundary", async (t) => {
       f.model.beforeWrite = () => mutate(f.model);
       assert.equal(await f.run("tick"), 0);
       assert.equal(f.model.writes.length, 0);
+      assert.equal(f.state().operation, undefined);
+    });
+  }
+});
+
+test("a retarget during the last switch read blocks the write", async (t) => {
+  const f = fixture(t);
+  f.model.beforeWrite = () => {
+    f.model.onCall = (argv) => {
+      if (argv[2]?.endsWith("/actions/variables/ACTIVE")) f.model.pr.baseRefName = "release";
+      return null;
+    };
+  };
+  assert.equal(await f.run("tick"), 0);
+  assert.equal(f.model.pr.baseRefName, "release");
+  assert.deepEqual(f.model.writes, []);
+  assert.equal(f.state().operation, undefined);
+});
+
+test("consent and hold approvals are evaluated after the final PR read", async (t) => {
+  for (const approval of ["consent", "hold"]) {
+    await t.test(approval, async (caseTest) => {
+      const f = fixture(caseTest);
+      const expires = Date.parse(START) + 60_000;
+      if (approval === "consent") f.model.until = new Date(expires);
+      else Object.assign(f.model, { changed: ["db/migrations/new.sql"], holdApproval: true, holdUntil: expires });
+      f.model.beforeWrite = () => {
+        f.model.onCall = (argv) => {
+          if (argv[1] === "pr" && argv[2] === "view") f.advance(1);
+          return null;
+        };
+      };
+      assert.equal(await f.run("tick"), 0);
+      assert.equal(f.model.now, expires);
+      assert.deepEqual(f.model.writes, []);
       assert.equal(f.state().operation, undefined);
     });
   }
