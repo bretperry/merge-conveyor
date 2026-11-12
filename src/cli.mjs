@@ -179,7 +179,12 @@ export const runCli = async (argv, {
     input = { days };
   }
   const action = values["dry-run"] ? "preview" : command;
-  if (stderr.isTTY && !values.json && ["queue", "explain", "preview"].includes(action)) emit(stderr, "Reading GitHub…");
+  const progress = {
+    queue: "Reading GitHub…", preview: "Previewing the next action…", explain: "Reading GitHub…",
+    status: "Checking worker status…", doctor: "Checking Conveyor setup…", report: "Reading merge history…",
+    tick: "Running one worker tick…", clear: "Recording clearance for the reviewed head…",
+  }[action];
+  if (stderr.isTTY && progress) emit(stderr, progress);
   const client = clientFactory({ configPath: values.config });
   const result = await client[action](input);
   if (values.json) emit(stdout, JSON.stringify(result));

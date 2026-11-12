@@ -199,9 +199,12 @@ test("CLI JSON is one result with stable exit codes and sanitized read errors", 
   };
   const json = await cli(["tick", "--dry-run", "--json"]);
   assert.equal(json.code, 0);
-  assert.equal(json.stderr, "");
+  assert.match(json.stderr, /Previewing the next action/u);
   assert.equal(json.stdout.trimEnd().split("\n").length, 1);
   assert.deepEqual(JSON.parse(json.stdout), await f.client.preview());
+  const tick = await cli(["tick"], { tick: async () => ({ ok: true, value: { kind: "idle", reason: { code: "no_action", message: "No action." } } }) });
+  assert.equal(tick.code, 0);
+  assert.match(tick.stderr, /Running one worker tick/u);
   assert.equal((await cli(["tick", "--dryrun"])).code, 2);
   const unknown = await cli(["tick", "--json"], { tick: async () => ({ ok: true, value: { kind: "unknown" } }) });
   assert.equal(unknown.code, 3);
