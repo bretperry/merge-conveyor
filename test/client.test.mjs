@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,7 +15,10 @@ const MERGE = "d".repeat(40);
 const START = "2026-01-01T12:00:00.000Z";
 const CONTEXT = "conveyor/cleared";
 const check = { __typename: "CheckRun", name: "Build", status: "COMPLETED", conclusion: "SUCCESS", detailsUrl: "https://example.test/check" };
-const clearance = (number) => ({ __typename: "StatusContext", context: `${CONTEXT}/pr-${number}/main`, state: "SUCCESS", createdAt: START });
+const clearance = (number, base = "main") => ({
+  __typename: "StatusContext", context: `${CONTEXT}/pr-${number}/${createHash("sha256").update(base).digest("hex").slice(0, 32)}`,
+  state: "SUCCESS", createdAt: START,
+});
 const ok = (value) => ({ status: 0, stdout: typeof value === "string" ? value : JSON.stringify(value), stderr: "" });
 const pull = (number = 1, headRefOid = HEAD) => ({
   number, title: `Pull request ${number}`, state: "OPEN", baseRefName: "main", baseRefOid: BASE, headRefOid, changedFiles: 1,
@@ -34,7 +38,7 @@ const fixture = (t, options = {}) => {
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
   const model = { prs: [pull()], calls: [], writes: [], time: Date.parse(START), viewer: 100, cleared: true, stale: new Set(), paths: new Map() };
   const find = (number) => model.prs.find((pr) => pr.number === Number(number));
-  const auth = () => model.prs.map((pr) => ({ context: `${CONTEXT}/pr-${pr.number}/main`, state: "success", creator: { id: 100 } }));
+  const auth = () => model.prs.map((pr) => ({ context: clearance(pr.number).context, state: "success", creator: { id: 100 } }));
   const run = (argv, context) => {
     model.calls.push(argv);
     const override = model.override?.(argv);
@@ -45,6 +49,7 @@ const fixture = (t, options = {}) => {
       if (argv.includes("--git-common-dir")) return ok(dir);
       if (group === "remote") return ok("https://github.com/example/widgets.git");
       if (argv.includes("--abbrev-ref")) return ok("main");
+      if (argv.includes("--get-regexp") || argv.includes("--stage")) return ok("");
       if (argv.includes("--porcelain")) return ok("");
       if (argv.at(-1) === "HEAD") return ok(BASE);
     }
@@ -57,17 +62,18 @@ const fixture = (t, options = {}) => {
       if (verb === "graphql") return page(model.prs.filter((pr) => pr.state === "OPEN"));
       if (verb === "user") return ok({ id: model.viewer });
       if (verb.endsWith("/commits/main")) return ok(BASE);
+      if (verb.includes("?per_page=1&page=1") && verb.includes("/compare/")) {
+        const [, base, head] = /compare\/(\w+)\.\.\.(\w+)/.exec(verb);
+        const pr = model.prs.find((item) => item.headRefOid === head);
+        return ok({ base, files: [{ filename: model.paths.get(pr.number) ?? "src/file.mjs", sha: MERGE, status: "modified",
+          contents_url: `https://api.github.com/repos/example/widgets/contents/file?ref=${head}` }] });
+      }
       if (verb.includes("/compare/")) return ok(model.stale.has(/compare\/(\w+)\.\.\./.exec(verb)[1]) ? 1 : 0);
       if (verb.includes("/statuses?")) return ok(model.cleared ? auth() : []);
       if (verb.includes("/rules/branches/")) return ok([{ type: "required_status_checks", parameters: {
         strict_required_status_checks_policy: true, required_status_checks: [{ context: "Build" }],
       } }]);
       if (verb.includes("/git/trees/")) return ok([false, []]);
-      if (verb.includes("/files?")) {
-        const pr = find(/pulls\/(\d+)\/files/.exec(verb)[1]);
-        return ok([{ filename: model.paths.get(pr.number) ?? "src/file.mjs", sha: MERGE, status: "modified",
-          contents_url: `https://api.github.com/repos/example/widgets/contents/file?ref=${pr.headRefOid}` }]);
-      }
       if (verb === "--method") {
         model.writes.push(argv);
         if (model.onWrite) return model.onWrite(argv);
@@ -190,15 +196,17 @@ test("clearance is pinned and idempotent, consent expires, and a veto runs only 
 
 test("clearance belongs to the reviewed PR and base, and a lost response is reconciled", async (t) => {
   const f = fixture(t);
-  f.model.prs[0] = { ...pull(2, HEAD), statusCheckRollup: [check, clearance(1), { ...clearance(2), context: `${CONTEXT}/pr-2/other` }] };
+  f.model.prs[0] = { ...pull(2, HEAD), statusCheckRollup: [check, clearance(1), clearance(2, "other")] };
   let statuses = [
     { context: clearance(1).context, state: "success", creator: { id: 100 } },
-    { context: `${CONTEXT}/pr-2/other`, state: "success", creator: { id: 100 } },
+    { context: clearance(2, "other").context, state: "success", creator: { id: 100 } },
   ];
   f.model.override = (argv) => argv[2]?.includes("/statuses?") ? ok(statuses) : null;
   value(await f.client.resume());
   assert.equal(value(await f.client.preview()).nextAction, null);
   const target = { number: 2, headSha: HEAD };
+  f.model.onWrite = () => ({ status: 1, stderr: "HTTP 403" });
+  assert.equal((await f.client.clear(target)).error.code, "insufficient_permission");
   f.model.onWrite = () => ok({});
   assert.equal(value(await f.client.clear(target)).kind, "unknown");
   f.model.onWrite = (argv) => {
@@ -208,7 +216,7 @@ test("clearance belongs to the reviewed PR and base, and a lost response is reco
   };
   assert.equal(value(await f.client.clear(target)).kind, "cleared");
   assert.equal(value(await f.client.clear(target)).kind, "already_cleared");
-  assert.equal(f.model.writes.length, 2);
+  assert.equal(f.model.writes.length, 3);
 });
 
 test("a short changed-file list cannot rule out a hold", async (t) => {
@@ -222,6 +230,53 @@ test("a short changed-file list cannot rule out a hold", async (t) => {
   assert.equal(f.model.writes.length, 0);
 });
 
+test("held paths must be read at the expected target during preflight", async (t) => {
+  const f = fixture(t);
+  let reads = 0;
+  f.model.override = (argv) => {
+    if (argv[2] !== "view" || !argv.at(-1).includes("changedFiles") || ++reads <= 2) return null;
+    return ok({ ...f.model.prs[0], baseRefName: "other" });
+  };
+  value(await f.client.resume());
+  assert.equal((await f.client.tick()).error.code, "data_unavailable");
+  assert.equal(f.model.writes.length, 0);
+});
+
+test("a failing status that shares a clearance prefix still blocks CI", async (t) => {
+  const f = fixture(t);
+  f.model.prs[0].statusCheckRollup.push({ ...clearance(1), context: `${CONTEXT}/pr-deploy`, state: "FAILURE" });
+  value(await f.client.resume());
+  const preview = value(await f.client.preview());
+  assert.equal(preview.nextAction, null);
+  assert.equal(preview.entries[0].reasons[0].code, "checks_failed");
+  await f.client.tick();
+  assert.equal(f.model.writes.length, 0);
+});
+
+test("preview disables executable Git filters and rejects submodule checkouts", async (t) => {
+  const f = fixture(t);
+  let submodule = false;
+  let statusRead = false;
+  f.model.override = (argv) => {
+    if (argv.includes("--get-regexp")) return ok("filter.fixture.process\0filter.fixture.clean\0");
+    if (argv.includes("--stage")) return ok(submodule ? `160000 ${HEAD} 0\tdependency\0` : "");
+    if (!argv.includes("--porcelain")) return null;
+    assert.ok(argv.includes("core.fsmonitor=false"));
+    assert.ok(argv.includes("filter.fixture.clean="));
+    assert.ok(argv.includes("filter.fixture.process="));
+    assert.ok(argv.includes("filter.fixture.required=false"));
+    statusRead = true;
+    return ok("");
+  };
+  value(await f.client.resume());
+  assert.equal(value(await f.client.preview()).nextAction.number, 1);
+  assert.equal(statusRead, true);
+  submodule = true;
+  statusRead = false;
+  assert.equal(value(await f.client.preview()).nextAction, null);
+  assert.equal(statusRead, false);
+});
+
 test("a pause cannot succeed while a tick owns consent", async (t) => {
   const f = fixture(t);
   value(await f.client.resume());
@@ -231,6 +286,7 @@ test("a pause cannot succeed while a tick owns consent", async (t) => {
     return { status: 1, stderr: "timeout" };
   };
   assert.equal(value(await f.client.tick()).kind, "unknown");
+  assert.equal(value(await f.client.status()).lastSuccessfulTickAt, null);
   assert.equal((await pause).error.code, "operator_locked");
   assert.equal(value(await f.client.pause()).changed, true);
   assert.equal(value(await f.client.tick()).reason.code, "paused");
@@ -290,6 +346,21 @@ test("a failed update comparison retains the journal and an undelivered legacy a
   f.model.override = null;
   await f.client.tick();
   assert.equal(value(await f.client.status()).lastAction.newHeadSha, HEAD2);
+});
+
+test("an unrelated force push does not confirm an update", async (t) => {
+  const f = fixture(t, { config: { autoUpdate: true } });
+  writeFileSync(f.statePath, JSON.stringify({
+    operation: { kind: "update", number: 1, head: HEAD, base: "main", baseSha: BASE, at: START },
+  }));
+  f.model.prs[0] = { ...pull(1, HEAD2), statusCheckRollup: [check] };
+  f.model.override = (argv) => argv[2]?.includes(`/compare/${HEAD2}...${HEAD}`) ? ok(1) : null;
+  value(await f.client.resume());
+  await f.client.tick();
+  const status = value(await f.client.status());
+  assert.equal(status.operation, null);
+  assert.equal(status.lastAction, null);
+  assert.equal(f.model.writes.length, 0);
 });
 
 test("CLI JSON is one result with stable exit codes and sanitized read errors", async (t) => {

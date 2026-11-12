@@ -2,6 +2,7 @@
 // Used by: the conveyor CLI and the package tests.
 // Exports: createConveyor.
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 
@@ -132,12 +133,13 @@ export const createWorker = (config, runtime) => {
 
 
   // The real status only: a check run anyone's workflow can name the same, and it isn't a review's mark.
-  const clearanceContext = (number) => runtime ? `${CLEARED_CONTEXT}/pr-${number}/${BASE_BRANCH}` : CLEARED_CONTEXT;
+  const clearanceBase = createHash("sha256").update(BASE_BRANCH).digest("hex").slice(0, 32);
+  const clearanceContext = (number) => runtime ? `${CLEARED_CONTEXT}/pr-${number}/${clearanceBase}` : CLEARED_CONTEXT;
   const isClearanceContext = ({ __typename: type, context }) => {
     if (type !== "StatusContext" || typeof context !== "string") return false;
     const name = context.toLowerCase();
     const prefix = CLEARED_CONTEXT.toLowerCase();
-    return name === prefix || (runtime && name.startsWith(`${prefix}/pr-`));
+    return name === prefix || (runtime && name.startsWith(`${prefix}/`) && /^pr-[1-9]\d*\/[0-9a-f]{32}$/u.test(name.slice(prefix.length + 1)));
   };
   const isClearedStatus = (row, number) => isClearanceContext(row) &&
     (runtime ? row.context === clearanceContext(number) : true);
@@ -238,7 +240,20 @@ export const createWorker = (config, runtime) => {
     const branch = run(["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"]);
     if (branch.status !== 0) return "can't read the worker's branch";
     if (branch.stdout.trim() !== BASE_BRANCH) return `this clone is on ${branch.stdout.trim() || "no branch"}, not ${BASE_BRANCH}`;
-    const status = run(["git", "-c", "core.fsmonitor=false", "--no-optional-locks", "-C", cwd, "status", "--porcelain"]);
+    const git = ["git", "-c", "core.fsmonitor=false", "--no-optional-locks", "-C", cwd];
+    if (runtime) {
+      const filters = run([...git, "config", "--null", "--name-only", "--get-regexp", "^filter\\..*\\.(clean|process)$"]);
+      if (filters.status !== 0 && (filters.status !== 1 || filters.stderr)) return "can't read checkout filter settings";
+      const drivers = new Set(filters.stdout.split("\0").filter(Boolean).map((name) => name.replace(/\.(clean|process)$/u, "")));
+      // A submodule can have its own filter configuration. Use a worker checkout without submodules.
+      const index = run([...git, "ls-files", "--stage", "-z"]);
+      if (index.status !== 0) return "can't read the worker's index";
+      if (/(?:^|\0)160000 /u.test(index.stdout)) return "the worker checkout contains submodules";
+      for (const driver of drivers) {
+        git.push("-c", `${driver}.clean=`, "-c", `${driver}.process=`, "-c", `${driver}.required=false`);
+      }
+    }
+    const status = run([...git, "status", "--porcelain"]);
     if (status.status !== 0) return "can't read the worker's checkout status";
     if (status.stdout.trim()) return "this clone has uncommitted changes";
     const tip = devTip(run);
@@ -248,8 +263,8 @@ export const createWorker = (config, runtime) => {
     return local.stdout.trim() === tip.sha ? "" : `this clone is at ${short(local.stdout.trim())}, which isn't ${BASE_BRANCH}'s tip ${short(tip.sha)}`;
   };
 
-  const heldState = (pr, run) => {
-    const state = readHeld(String(pr.number), run);
+  const heldState = (pr, run, base) => {
+    const state = runtime ? readHeld(String(pr.number), run, { base, baseName: BASE_BRANCH }) : readHeld(String(pr.number), run);
     if (state?.error) return { error: state.error };
     if (state?.head !== pr.head || !Array.isArray(state.paths) || state.paths.length === 0 ||
       !state.paths.every((path) => typeof path === "string" && path.length > 0) || !Array.isArray(state.files) || state.files.length === 0) {
@@ -372,9 +387,13 @@ export const createWorker = (config, runtime) => {
         const compared = staleness(pr.headRefOid, run, operation.baseSha);
         if (compared.error) return waiting(`can't verify #${operation.number}'s updated head against the recorded base`, true);
         if (!compared.stale) {
-          const action = { kind: "updated", number: operation.number, headSha: operation.head, newHeadSha: pr.headRefOid, at: now.toISOString() };
-          if (state.lastAction?.newHeadSha !== action.newHeadSha || state.lastAction?.number !== action.number) state.lastAction = action;
-          if (seen.submitted === operation) seen.outcome = action;
+          const prior = staleness(pr.headRefOid, run, operation.head);
+          if (prior.error) return waiting(`can't verify #${operation.number}'s updated head against the recorded head`, true);
+          if (!prior.stale) {
+            const action = { kind: "updated", number: operation.number, headSha: operation.head, newHeadSha: pr.headRefOid, at: now.toISOString() };
+            if (state.lastAction?.newHeadSha !== action.newHeadSha || state.lastAction?.number !== action.number) state.lastAction = action;
+            if (seen.submitted === operation) seen.outcome = action;
+          }
         }
       }
       if (pr.baseRefName === operation.base && !classify(pr).checksDone && age < limit) return waiting(`#${operation.number}'s updated head is still waiting on checks`);
@@ -392,7 +411,7 @@ export const createWorker = (config, runtime) => {
     const clone = cloneProblem(cwd, run);
     if (clone) return clone;
     if (!hasStrictChecks(run, BASE_BRANCH)) return `can't verify strict required checks on ${BASE_BRANCH}`;
-    const held = heldState(pr, run);
+    const held = heldState(pr, run, baseSha);
     if (held.error) return held.error;
     const clearance = clearanceProblem(pr.head, pr.number, run);
     if (clearance) return clearance;
@@ -418,7 +437,7 @@ export const createWorker = (config, runtime) => {
   function* candidateObservations(prs, state, now, reconciledOpen, { dev, dir, run }) {
     for (const candidate of rankedCandidates(prs, state, now, MERGE_RETRY_MINUTES * MINUTE, reconciledOpen)) {
       const { pr, mergeRetryAt } = candidate;
-      const held = mergeRetryAt ? undefined : heldState(pr, run);
+      const held = mergeRetryAt ? undefined : heldState(pr, run, dev.sha);
       const classes = held && !held.error ? openHolds(dir, pr.number, now, held) : undefined;
       const moved = held && !held.error && !classes.length ? staleness(pr.head, run, dev.sha) : undefined;
       let decision = candidateDecision(candidate, { held, classes, moved }, AUTO_UPDATE);
@@ -757,7 +776,7 @@ export const createWorker = (config, runtime) => {
       }
       if (!dry) flush();
       const code = await pass({ cwd, run, clock, env, hook: failureHook, dir, now, state, tell, alarm, save, land, seen, dry });
-      if (runtime && code === 0 && seen.unread.length === 0 && !seen.preflight) state.lastSuccessfulTickAt = now.toISOString();
+      if (runtime && code === 0 && seen.unread.length === 0 && !seen.preflight && (!seen.submitted || seen.outcome)) state.lastSuccessfulTickAt = now.toISOString();
       return dry ? report() : code;
     } catch (error) {
       if (dry) {
@@ -1073,7 +1092,12 @@ export const createWorker = (config, runtime) => {
     }
     const moved = verifyTarget();
     if (moved) return { error: moved };
-    postCleared(run, number, headSha, "Reviews passed at this head");
+    if (postCleared(run, number, headSha, "Reviews passed at this head")) {
+      const failure = runtime.readError("Could not record clearance for this head.");
+      if (["missing_auth", "insufficient_permission", "not_found", "rate_limited", "missing_github_cli", "read_budget_exhausted"].includes(failure.code)) {
+        return { error: failure };
+      }
+    }
     const reconciled = runtime.latestClearance(run, headSha, context);
     if (!reconciled.error && reconciled.status?.state === "success" && reconciled.status.creator?.id === CLEARANCE_PUBLISHER) {
       return { value: { kind: "cleared", number, headSha } };
