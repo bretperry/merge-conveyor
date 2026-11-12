@@ -17,17 +17,16 @@
 //   1 shape    HEAD exists; no symlink or submodule; no gitleaks config or ignore file (they would steer the scan); no export-ignore or
 //              export-subst attribute (git archive would drop or rewrite a file the scan reads); no refs/replace ref (it hides a commit);
 //              no binary file, in the tree or in any commit, that was not named as binary (gitleaks skips binaries)
-//   2 kit      LICENSE is the official template with only the year and licensor filled; no {{…}} is left in a kit file; package.json, if there, says "license": "FSL-1.1-MIT"
+//   2 kit      LICENSE is the official template with only the year and licensor filled; no {{…}} is left in a kit file; package.json, if there, says "license": "MIT"
 //   3 terms    HARNESS_DENYLIST over every file in every commit (all encodings), every path ever committed, every commit message and identity,
-//              every ref name, every annotated tag (name, tagger, message). Exact canonical family URLs and the exact author/committer
-//              identity are the only term exceptions. A report names a term by its number, never a path or ref name.
+//              every ref name, every annotated tag (name, tagger, message). A report names a term by its number, never a path or ref name.
 //   4 paths    generic home folders and runner labels (PATH_TERMS); private machine names belong only in HARNESS_DENYLIST.
 //              The only step with an allow list: exact strings from the manifest's `allow`, blanked out before the search; never applied to step 3
 //   5 secrets  gitleaks over the tree, over the tree's files under neutral names, and over the history; a gitleaks suppression marker in any commit is red
 //
 // The exceptions: the filled `Copyright <year> <licensor>` line of LICENSE; the licensor name in unique real author, committer,
-// or tagger headers; the exact approved email for a matching author or committer; and exact canonical family URLs. Step 2 makes
-// sure the copyright name appears only on the template line by requiring the rest of LICENSE to equal the template.
+// or tagger headers; the exact approved email and its GitHub login in matching author or committer headers; and exact canonical family URLs.
+// Step 3 also masks the exact first message line of one approved merge commit. Step 2 requires the rest of LICENSE to equal the template.
 // Not enforced: a term that was encoded or split (publish-terms.mjs header), a secret gitleaks has no rule for, and the content of what the listed files do.
 
 import { spawnSync } from "node:child_process";
@@ -189,7 +188,7 @@ const kitStep = (dir, tree, values) => {
   const lines = [];
   const license = blobAt(dir, LICENSE_PATH);
   if (license === null) lines.push(`${LICENSE_PATH} is missing`);
-  else if (license.toString("utf8") !== renderKitFile(LICENSE_PATH, values)) lines.push(`${LICENSE_PATH} is not the FSL-1.1-MIT template with only the year and licensor filled (the terms are never edited)`);
+  else if (license.toString("utf8") !== renderKitFile(LICENSE_PATH, values)) lines.push(`${LICENSE_PATH} is not the MIT template with only the year and licensor filled (the terms are never edited)`);
   for (const path of Object.keys(KIT_FILES)) {
     const text = blobAt(dir, path)?.toString("utf8");
     if (text === undefined) lines.push(`${path} is missing`);
@@ -203,7 +202,7 @@ const kitStep = (dir, tree, values) => {
     } catch {
       lines.push("package.json is not valid JSON");
     }
-    if (declared !== "FSL-1.1-MIT") lines.push('package.json must say "license": "FSL-1.1-MIT"');
+    if (declared !== "MIT") lines.push('package.json must say "license": "MIT"');
   }
   return step("kit", lines);
 };
@@ -220,33 +219,50 @@ const APPROVED_FAMILY_URL_FINGERPRINTS = new Set([
   "05bb3bfa6e84485ddfec76cb323053de1cc1cde64e516efd8657f7d60be08ca1",
   "4f65d74bfe164aee7a8040b1c036dfefbcf62a56d858ccd042e267b10a627dbb",
   "6f6f75de36c714e4e8b6239d89bcbd2b1c0a2237e8a6761a3f695ce14eada72c",
+  "edd67fa590150f8b20533938308482f8b69437c82420d2805d4252abb373ef8a",
+  "7508b3f32f00ea9f133aa8012f268306ef099c7793a42bbaea67f3d03aed100b",
+  "11dabefd36802fabc22f63f63b0afadbd6606415089f6d9cb3bc55b86b86a1dc",
 ]);
 const APPROVED_IDENTITY_EMAIL_FINGERPRINT = "edf66de584f8889227f518d4c4e2a20e679a40e77f401af4091956d7fc8dae53";
-const fingerprint = (text) => createHash("sha256").update(text, "utf8").digest("hex");
+// The default GitHub subject of the Phase 1 merge contains the login. Preserve the stored history.
+const APPROVED_COMMIT_SUBJECT = Object.freeze({
+  oid: "7e6385926b5688f7234fd8937e22099dc77872d3",
+  fingerprint: "4ab9f2bbe4b1a415a835e93b0200dd04037b2f18988349225dd518489bb42a21",
+});
+const fingerprint = (value) => createHash("sha256").update(value).digest("hex");
 const URL_DELIMITERS = new Set([" ", "\t", "\r", "\n", "<", ">", "\"", "'", "`"]);
 
 // Test-only policy injection uses the same exact-match engine with a fictional, fixed test policy.
 // Production callers use `gate`, whose fingerprints are immutable module constants.
-export const createGateForTesting = ({ familyUrlFingerprints, identityEmailFingerprint }) => {
+export const createGateForTesting = ({ familyUrlFingerprints, identityEmailFingerprint, commitSubjectException }) => {
   if (!(familyUrlFingerprints instanceof Set) || familyUrlFingerprints.size === 0 || [...familyUrlFingerprints].some((value) => !/^[a-f0-9]{64}$/u.test(value))) {
     throw new TypeError("family URL policy must be a non-empty set of SHA-256 fingerprints");
   }
   if (typeof identityEmailFingerprint !== "string" || !/^[a-f0-9]{64}$/u.test(identityEmailFingerprint)) {
     throw new TypeError("identity email policy must be a SHA-256 fingerprint");
   }
+  const fixedCommitSubjectException = commitSubjectException === undefined ? undefined : { ...commitSubjectException };
+  if (fixedCommitSubjectException !== undefined) {
+    const { oid, fingerprint: subjectFingerprint } = fixedCommitSubjectException;
+    if (typeof oid !== "string" || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u.test(oid) || typeof subjectFingerprint !== "string" || !/^[a-f0-9]{64}$/u.test(subjectFingerprint)) {
+      throw new TypeError("commit subject policy must pair a full Git object ID with a SHA-256 fingerprint");
+    }
+  }
   const fixedUrlFingerprints = new Set(familyUrlFingerprints);
-  return (options) => gateWithPolicy(options, fixedUrlFingerprints, identityEmailFingerprint);
+  return (options) => gateWithPolicy(options, fixedUrlFingerprints, identityEmailFingerprint, fixedCommitSubjectException);
 };
 
 // Recognize one complete, lossless Git identity line before muting any part of it.
-const identityFields = (line, role, licensor) => {
+const identityFields = (line, role) => {
   const text = Buffer.isBuffer(line) ? line.toString("utf8") : line;
   if (Buffer.isBuffer(line) && !Buffer.from(text, "utf8").equals(line)) return null;
-  const prefix = `${role} ${licensor} <`;
+  const prefix = `${role} `;
   if (!text.startsWith(prefix)) return null;
-  const match = /^([^<>\s]+)> (-?\d+) ([+-]\d{4})$/u.exec(text.slice(prefix.length));
-  return match === null ? null : { text, prefix, email: match[1] };
+  const match = /^([^<>\r\n]+) <([^<>\s]+)> -?\d+ [+-]\d{4}$/u.exec(text.slice(prefix.length));
+  return match === null ? null : { name: match[1], email: match[2] };
 };
+
+const GITHUB_NOREPLY_EMAIL = /^\d+\+([A-Za-z0-9]+(?:-[A-Za-z0-9]+)*)@users\.noreply\.github\.com$/u;
 
 // Only a whole canonical URL token is exempt. Query values and URL-shaped suffixes remain intact.
 const blankedFamilyUrls = (text, urlFingerprints, { patch = false } = {}) => {
@@ -312,12 +328,18 @@ const historyCommits = (dir, licensor, identityEmailFingerprint) => {
     const uniqueIdentityHeaders = (role) => headers.filter((line) => line.subarray(0, role.length + 1).equals(Buffer.from(`${role} `, "ascii"))).length === 1;
     const maskIdentity = (line, role) => {
       if (!uniqueIdentityHeaders(role)) return line;
-      const fields = identityFields(line, role, licensor);
+      const fields = identityFields(line, role);
       if (fields === null) return line;
-      let masked = Buffer.from(line);
-      masked.fill(0x20, role.length + 1, role.length + 1 + Buffer.byteLength(licensor));
-      if (fingerprint(fields.email) === identityEmailFingerprint) {
-        const emailAt = Buffer.byteLength(fields.prefix);
+      const approvedEmail = fingerprint(fields.email) === identityEmailFingerprint;
+      // GitHub can write the login as the name. Derive it only from the exact approved address.
+      const login = approvedEmail ? GITHUB_NOREPLY_EMAIL.exec(fields.email)?.[1] : undefined;
+      if (fields.name !== licensor && fields.name !== login) return line;
+      const nameAt = role.length + 1;
+      const nameEnd = nameAt + Buffer.byteLength(fields.name);
+      const masked = Buffer.from(line);
+      masked.fill(0x20, nameAt, nameEnd);
+      if (approvedEmail) {
+        const emailAt = nameEnd + " <".length;
         masked.fill(0x20, emailAt, emailAt + Buffer.byteLength(fields.email));
       }
       return masked;
@@ -327,9 +349,18 @@ const historyCommits = (dir, licensor, identityEmailFingerprint) => {
       if (line.subarray(0, 10).equals(Buffer.from("committer ", "ascii"))) return maskIdentity(line, "committer");
       return line;
     });
-    commits.push({ metadata: Buffer.concat(metadata.flatMap((line, at) => (at === 0 ? [line] : [Buffer.from("\n"), line]))), message });
+    commits.push({ oid, metadata: Buffer.concat(metadata.flatMap((line, at) => (at === 0 ? [line] : [Buffer.from("\n"), line]))), message });
   }
   return commits;
+};
+
+// Match the raw first message line before any other masking. Keep the LF and byte offsets for the remaining checks.
+const maskCommitSubject = ({ oid, message }, exception) => {
+  if (oid !== exception?.oid) return message;
+  const newline = message.indexOf(10);
+  const end = newline === -1 ? message.length : newline;
+  if (fingerprint(message.subarray(0, end)) !== exception.fingerprint) return message;
+  return Buffer.from(message).fill(0x20, 0, end);
 };
 
 // Remove the licensor name only from one actual tagger header; tag message lookalikes and tagger emails stay searchable.
@@ -340,8 +371,8 @@ const withoutLicensorTagger = (tag, licensor) => {
   const taggers = lines.filter((line) => line.startsWith("tagger "));
   const header = lines.map((line) => {
     if (taggers.length !== 1) return line;
-    const fields = identityFields(line, "tagger", licensor);
-    return fields === null ? line : `${line.slice(0, "tagger ".length)}${" ".repeat(licensor.length)}${line.slice("tagger ".length + licensor.length)}`;
+    const fields = identityFields(line, "tagger");
+    return fields?.name === licensor ? `${line.slice(0, "tagger ".length)}${" ".repeat(licensor.length)}${line.slice("tagger ".length + licensor.length)}` : line;
   });
   return `${header.join("\n")}\n\n${tag.slice(split + 2)}`;
 };
@@ -418,7 +449,7 @@ const withoutCopyrightPatch = (log, { licensor, year }) => {
 };
 
 // One search of the repo for `terms`: contents of every blob in every commit, every path ever committed, the history text, ref names, tags. Returns hit objects.
-const scanRepo = (dir, tree, terms, values, facts, urlFingerprints, allow = []) => {
+const scanRepo = (dir, tree, terms, values, facts, urlFingerprints, { allow = [], commitSubjectException } = {}) => {
   const hits = [];
   const copyright = copyrightLine(values.year, values.licensor);
   for (const { path, bytes } of facts.blobs) {
@@ -430,7 +461,8 @@ const scanRepo = (dir, tree, terms, values, facts, urlFingerprints, allow = []) 
   for (const path of new Set([...tree.map((entry) => entry.path), ...facts.paths])) hits.push(...scanPath(blanked(path, allowedIn(allow, undefined)), terms).map((hit) => ({ ...hit, path })));
   for (const commit of facts.commits) {
     hits.push(...scanBytes("commit metadata", commit.metadata, terms));
-    hits.push(...scanBytes("commit message", blankedFamilyUrlBytes(commit.message, urlFingerprints), terms));
+    const message = maskCommitSubject(commit, commitSubjectException);
+    hits.push(...scanBytes("commit message", blankedFamilyUrlBytes(message, urlFingerprints), terms));
   }
   const log = blankedFamilyUrls(withoutCopyrightPatch(facts.log, values), urlFingerprints, { patch: true });
   hits.push(...scanLog(allow.length === 0 ? log : logWithoutAllowed(log, allow), terms));
@@ -449,7 +481,7 @@ const capped = (lines) => (lines.length > SHOWN ? [...lines.slice(0, SHOWN), `an
 const shown = (path, personal) => (scanPath(path, personal).length > 0 ? "(a path that holds a term)" : path);
 
 // Steps 3 and 4: the same search, two lists.
-const termStep = (dir, tree, terms, values, facts, urlFingerprints) => {
+const termStep = (dir, tree, terms, values, facts, urlFingerprints, commitSubjectException) => {
   const describe = (hit) => {
     const number = `term #${hit.term + 1}`;
     if (hit.where === "path") return `${number} in a path`;
@@ -457,14 +489,14 @@ const termStep = (dir, tree, terms, values, facts, urlFingerprints) => {
     if (hit.where === "tag") return `${number} in an annotated tag (its name, tagger or message)`;
     return describeHit({ ...hit, path: shown(hit.path, terms) });
   };
-  return step("terms", capped([...new Set(scanRepo(dir, tree, terms, values, facts, urlFingerprints).map(describe))]));
+  return step("terms", capped([...new Set(scanRepo(dir, tree, terms, values, facts, urlFingerprints, { commitSubjectException }).map(describe))]));
 };
 
 const pathStep = (dir, tree, terms, values, facts, urlFingerprints, allow) => {
   const tripwires = parseTerms(PATH_TERMS.join("\n"));
   // Here the tripwire itself is not secret, so the report says which one went off; a path that holds a personal term is still not repeated.
   const describe = (hit) => `${hit.where} ${shown(hit.path, terms)}${hit.line > 0 ? `:${hit.line}` : ""} holds "${PATH_TERMS[hit.term]}" (a home folder or a runner label)`;
-  return step("paths", capped([...new Set(scanRepo(dir, tree, tripwires, values, facts, urlFingerprints, allow).map(describe))]));
+  return step("paths", capped([...new Set(scanRepo(dir, tree, tripwires, values, facts, urlFingerprints, { allow }).map(describe))]));
 };
 
 // Step 5.
@@ -495,7 +527,7 @@ const secretsStep = (dir, tree, blobs, personal, historyNames) => {
 
 // Runs every step on the repo at `dir`. `options`: { dir, terms (folded, from parseTerms), licensor, year, binary (paths allowed to be binary), allow (exact strings the paths step ignores) }.
 // Returns { ok, steps: [{ name, ok, lines }] }.
-const gateWithPolicy = ({ dir, terms, licensor, year, binary = [], allow = [], skipTerms = false }, urlFingerprints, identityEmailFingerprint) => {
+const gateWithPolicy = ({ dir, terms, licensor, year, binary = [], allow = [], skipTerms = false }, urlFingerprints, identityEmailFingerprint, commitSubjectException) => {
   if (!skipTerms && (!Array.isArray(terms) || terms.length === 0 || terms.some((term) => typeof term !== "string" || term.trim() === ""))) return { ok: false, steps: [step("terms", ["the gate never runs without its term list"])] };
   const missing = toolProblem();
   if (missing !== null) return { ok: false, steps: [step("tools", [missing])] };
@@ -527,7 +559,15 @@ const gateWithPolicy = ({ dir, terms, licensor, year, binary = [], allow = [], s
       refs: refs.filter((ref) => !ref.startsWith("refs/publish/")),
       tags,
     };
-    const steps = [shapeStep(dir, tree, refs, facts.blobs, binary, terms), kitStep(dir, tree, values), (skipTerms ? { name: "terms", ok: true, lines: ["SKIPPED private terms: fork PR has no denylist secret"] } : termStep(dir, tree, terms, values, facts, urlFingerprints)), pathStep(dir, tree, terms, values, facts, urlFingerprints, allowed), secretsStep(dir, tree, facts.blobs, terms, facts.paths)];
+    const steps = [
+      shapeStep(dir, tree, refs, facts.blobs, binary, terms),
+      kitStep(dir, tree, values),
+      skipTerms
+        ? { name: "terms", ok: true, lines: ["SKIPPED private terms: fork PR has no denylist secret"] }
+        : termStep(dir, tree, terms, values, facts, urlFingerprints, commitSubjectException),
+      pathStep(dir, tree, terms, values, facts, urlFingerprints, allowed),
+      secretsStep(dir, tree, facts.blobs, terms, facts.paths),
+    ];
     return { ok: steps.every(({ ok }) => ok), steps };
   } finally {
     if (savedReplace === undefined) delete process.env.GIT_NO_REPLACE_OBJECTS;
@@ -536,7 +576,7 @@ const gateWithPolicy = ({ dir, terms, licensor, year, binary = [], allow = [], s
 };
 
 // Production entry point: only the fixed fingerprints above can affect CLI and normal callers.
-export const gate = (options) => gateWithPolicy({ ...options, skipTerms: false }, APPROVED_FAMILY_URL_FINGERPRINTS, APPROVED_IDENTITY_EMAIL_FINGERPRINT);
+export const gate = (options) => gateWithPolicy({ ...options, skipTerms: false }, APPROVED_FAMILY_URL_FINGERPRINTS, APPROVED_IDENTITY_EMAIL_FINGERPRINT, APPROVED_COMMIT_SUBJECT);
 
 // The report as lines: one per step, then the red steps' findings.
 export const formatReport = ({ steps }) => steps.flatMap(({ name, ok, lines }) => [`${ok ? "✓" : "✗"} ${name}`, ...lines.map((line) => `    ${line}`)]);
@@ -590,7 +630,7 @@ export const main = (argv, env = process.env, write = (line) => console.log(line
     write(`✗ ${missing}`);
     return 1;
   }
-  const result = gateWithPolicy({ dir: resolve(repo), terms, licensor, year, binary: [...binary, ...(options.binary ?? [])], allow: [...allow, ...(options.allow ?? [])], skipTerms }, APPROVED_FAMILY_URL_FINGERPRINTS, APPROVED_IDENTITY_EMAIL_FINGERPRINT);
+  const result = gateWithPolicy({ dir: resolve(repo), terms, licensor, year, binary: [...binary, ...(options.binary ?? [])], allow: [...allow, ...(options.allow ?? [])], skipTerms }, APPROVED_FAMILY_URL_FINGERPRINTS, APPROVED_IDENTITY_EMAIL_FINGERPRINT, APPROVED_COMMIT_SUBJECT);
   for (const line of formatReport(result)) write(line);
   return result.ok ? 0 : 1;
 };

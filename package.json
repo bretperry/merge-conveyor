@@ -6,16 +6,32 @@
   "engines": {
     "node": ">=22"
   },
-  "license": "FSL-1.1-MIT",
+  "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/bretperry/conveyor"
+    "url": "https://github.com/bretperry/merge-conveyor"
   },
-  "exports": "./src/index.mjs",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.mts",
+      "default": "./src/index.mjs"
+    }
+  },
   "files": [
-    "src/"
+    "README.html",
+    "src/",
+    "docs/agent-walkthrough.md",
+    "docs/api.md",
+    "docs/operator-recovery.md",
+    "examples/conveyor.json",
+    "CONTRIBUTING.md",
+    "SECURITY.md"
   ],
   "scripts": {
     "test": "node --test"
-  }
+  },
+  "bin": {
+    "conveyor": "./src/bin.mjs"
+  },
+  "types": "./src/index.d.mts"
 }
