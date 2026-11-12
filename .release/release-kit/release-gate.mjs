@@ -26,7 +26,7 @@
 //   5 secrets  gitleaks over the tree, over the tree's files under neutral names, and over the history; a gitleaks suppression marker in any commit is red
 //
 // The exceptions: the filled `Copyright <year> <licensor>` line of LICENSE; the licensor name in unique real author, committer,
-// or tagger headers; the exact approved email for a matching author or committer; and exact canonical family URLs. Step 2 makes
+// or tagger headers; the exact approved email and its GitHub login in matching author or committer headers; and exact canonical family URLs. Step 2 makes
 // sure the copyright name appears only on the template line by requiring the rest of LICENSE to equal the template.
 // Not enforced: a term that was encoded or split (publish-terms.mjs header), a secret gitleaks has no rule for, and the content of what the listed files do.
 
@@ -239,14 +239,16 @@ export const createGateForTesting = ({ familyUrlFingerprints, identityEmailFinge
 };
 
 // Recognize one complete, lossless Git identity line before muting any part of it.
-const identityFields = (line, role, licensor) => {
+const identityFields = (line, role) => {
   const text = Buffer.isBuffer(line) ? line.toString("utf8") : line;
   if (Buffer.isBuffer(line) && !Buffer.from(text, "utf8").equals(line)) return null;
-  const prefix = `${role} ${licensor} <`;
+  const prefix = `${role} `;
   if (!text.startsWith(prefix)) return null;
-  const match = /^([^<>\s]+)> (-?\d+) ([+-]\d{4})$/u.exec(text.slice(prefix.length));
-  return match === null ? null : { text, prefix, email: match[1] };
+  const match = /^([^<>\r\n]+) <([^<>\s]+)> -?\d+ [+-]\d{4}$/u.exec(text.slice(prefix.length));
+  return match === null ? null : { name: match[1], email: match[2] };
 };
+
+const GITHUB_NOREPLY_EMAIL = /^\d+\+([A-Za-z0-9]+(?:-[A-Za-z0-9]+)*)@users\.noreply\.github\.com$/u;
 
 // Only a whole canonical URL token is exempt. Query values and URL-shaped suffixes remain intact.
 const blankedFamilyUrls = (text, urlFingerprints, { patch = false } = {}) => {
@@ -312,12 +314,18 @@ const historyCommits = (dir, licensor, identityEmailFingerprint) => {
     const uniqueIdentityHeaders = (role) => headers.filter((line) => line.subarray(0, role.length + 1).equals(Buffer.from(`${role} `, "ascii"))).length === 1;
     const maskIdentity = (line, role) => {
       if (!uniqueIdentityHeaders(role)) return line;
-      const fields = identityFields(line, role, licensor);
+      const fields = identityFields(line, role);
       if (fields === null) return line;
-      let masked = Buffer.from(line);
-      masked.fill(0x20, role.length + 1, role.length + 1 + Buffer.byteLength(licensor));
-      if (fingerprint(fields.email) === identityEmailFingerprint) {
-        const emailAt = Buffer.byteLength(fields.prefix);
+      const approvedEmail = fingerprint(fields.email) === identityEmailFingerprint;
+      // GitHub can write the login as the name. Derive it only from the exact approved address.
+      const login = approvedEmail ? GITHUB_NOREPLY_EMAIL.exec(fields.email)?.[1] : undefined;
+      if (fields.name !== licensor && fields.name !== login) return line;
+      const nameAt = role.length + 1;
+      const nameEnd = nameAt + Buffer.byteLength(fields.name);
+      const masked = Buffer.from(line);
+      masked.fill(0x20, nameAt, nameEnd);
+      if (approvedEmail) {
+        const emailAt = nameEnd + " <".length;
         masked.fill(0x20, emailAt, emailAt + Buffer.byteLength(fields.email));
       }
       return masked;
@@ -340,8 +348,8 @@ const withoutLicensorTagger = (tag, licensor) => {
   const taggers = lines.filter((line) => line.startsWith("tagger "));
   const header = lines.map((line) => {
     if (taggers.length !== 1) return line;
-    const fields = identityFields(line, "tagger", licensor);
-    return fields === null ? line : `${line.slice(0, "tagger ".length)}${" ".repeat(licensor.length)}${line.slice("tagger ".length + licensor.length)}`;
+    const fields = identityFields(line, "tagger");
+    return fields?.name === licensor ? `${line.slice(0, "tagger ".length)}${" ".repeat(licensor.length)}${line.slice("tagger ".length + licensor.length)}` : line;
   });
   return `${header.join("\n")}\n\n${tag.slice(split + 2)}`;
 };
