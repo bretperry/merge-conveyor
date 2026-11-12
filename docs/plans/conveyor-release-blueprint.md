@@ -18,8 +18,8 @@ Conveyor should give maintainers and agents a reliable way to see what is waitin
 |---|---|---|---|---|
 | 0 | Settle scope and public contract | — | deep (xhigh) | landed; owner approved 2026-11-11 |
 | 1 | Harden merge, state, and recovery | 0 | deep (xhigh) | landed (#1); farrier passed; dynamite passed after fixes; Package gate passed at 7cc9bf8; live checks scheduled for Phase 4a |
-| 2 | Ship the CLI, queue, and typed API | 1 | workhorse (high) | running; held by codex/conveyor-phase-2 |
-| 3 | Write public docs and clean up comments | 2 | workhorse (medium) | |
+| 2 | Ship the CLI, queue, and typed API | 1 | workhorse (high) | landed (#3); farrier passed; dynamite passed; Package gate passed |
+| 3 | Write public docs and clean up comments | 2 | workhorse (medium) | running; held by codex/conveyor-phase-3 |
 | 4a | Rehearse install, upgrade, and release | 3 | deep (high) | |
 | 4b | Polish CLI and docs | 4a; preview approved | workhorse (medium) | |
 | 5 | Make public and publish | 4b; license decided | — (human) | |
@@ -185,10 +185,10 @@ Pack and install in a clean directory, validate the tarball and commit history, 
 
 **Done when:** A human and an agent each complete queue inspection through merge using the README → verify: rehearsal transcripts, package contents, CI run, and preview approval.
 
-### Human checks
+**Human checks**
 
-- [ ] `conveyor-4a-worker-permissions` — decision · 10 min · none — in a disposable repo demonstrate that strict checks apply to the actual worker identity and a PR retargeted outside configured base cannot be merged by that identity
-- [ ] `conveyor-4a-rollback-journal` — decision · 10 min · none — stop both worker versions, reconcile any pending write against GitHub, then restore the prior pin and confirm no duplicate write
+- `conveyor-4a-worker-permissions` · decision · 10 min · none — Verify the worker’s branch permissions. In a disposable repo, show that strict checks apply to the worker identity and that it cannot merge a PR retargeted outside the configured base.
+- `conveyor-4a-rollback-journal` · decision · 10 min · none — Rehearse journal rollback. Stop both worker versions, reconcile any pending write against GitHub, then restore the prior pin and confirm no duplicate write.
 
 ## Phase 4b — Polish CLI and docs
 
