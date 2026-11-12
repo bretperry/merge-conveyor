@@ -19,8 +19,8 @@ Conveyor should give maintainers and agents a reliable way to see what is waitin
 | 0 | Settle scope and public contract | — | deep (xhigh) | landed; owner approved 2026-11-11 |
 | 1 | Harden merge, state, and recovery | 0 | deep (xhigh) | landed (#1); farrier passed; dynamite passed after fixes; Package gate passed at 7cc9bf8; live checks scheduled for Phase 4a |
 | 2 | Ship the CLI, queue, and typed API | 1 | workhorse (high) | landed (#3); farrier passed; dynamite passed; Package gate passed |
-| 3 | Write public docs and clean up comments | 2 | workhorse (medium) | QA passed (#4); farrier passed; dynamite skipped |
-| 4a | Rehearse install, upgrade, and release | 3 | deep (high) | |
+| 3 | Write public docs and clean up comments | 2 | workhorse (medium) | landed (#4); farrier passed; Package gate passed |
+| 4a | Rehearse install, upgrade, and release | 3 | deep (high) | running; held by codex/conveyor-phase-4a |
 | 4b | Polish CLI and docs | 4a; preview approved | workhorse (medium) | |
 | 5 | Make public and publish | 4b; license decided | — (human) | |
 
