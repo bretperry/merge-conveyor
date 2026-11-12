@@ -6,7 +6,7 @@ Source commit `451bca7f492dbe4148d22858e88ce3adcf0a84e8` · 2026-11-12
 
 - Packed `merge-conveyor@0.1.0` from a Git archive of the exact source commit. Independently rebuilt the tarball and matched every byte. Clean offline install and all 106 source tests passed.
 - SHA-256 `13e516ed96fc6e433a93b350e7d2c167f27b08074c8167f4a1072264948a0e8e`. The 55,506-byte archive contains 24 entries covering the CLI and library, type declarations, package metadata, public docs, license and config example.
-- Git connectivity and redacted secret scans passed for the tarball and all 19 commits reachable from the source commit. The merged docs PR passed the full Package gate at its reviewed head (run `43245517480`). The full release gate passed locally on the exact rehearsal source commit. The rehearsal source commit adds only a blueprint status update after the docs merge.
+- Git connectivity passed for all 25 commits reachable from the source commit. Redacted secret scans passed on the tarball and on the 19 non-merge commit patches inspected by Gitleaks. The merged docs PR passed the full Package gate at its reviewed head (run `43245517480`). The full release gate passed locally on the exact rehearsal source commit, which adds only a blueprint status update after the docs merge.
 - Ran `npm publish --dry-run --offline --ignore-scripts` on the packed archive against a reserved test registry with empty npm config. The dry run exited successfully.
 
 ## Installed CLI read budgets
