@@ -35,7 +35,7 @@ The private synthetic fixture used real Actions checks, an up-to-date base check
 | PR #3 into `main` | Required CI failed. An exact-head merge request returned HTTP 405, `Required status check "rehearsal-ci" is failing.` PR remained open. | Actions run `43247219215` |
 | PR #4 retargeted from `main` to `outside` | CI passed. The alternate base was locked and enforced for administrators. An exact-head merge request returned HTTP 405, `Cannot change this locked branch`. PR remained open on `outside`. | Actions run `43247229123` |
 | Independent fresh-user agent, PR #1 | Installed from the README, ran doctor and inspected queue and explain. Reviewed and cleared the exact head, resumed, previewed the merge, ticked once, verified the merge in GitHub and paused. | PR CI `43247198597`, post-merge base CI `43247798927` |
-| Owner, PR #2 | Independent README walkthrough and permissions and rollback checks pending. A dedicated checkout is current at the base tip. | Refreshed exact-head CI `43247992184` passed |
+| Owner, PR #2 | Installed candidate and followed the README. Exact reviewed head `f9be5dc7a30b3aadc750df5fb887020b5991da13` merged as `e61895798e463e9e50af430c453a4025a5bf0b96`; worker paused afterward. Strict required checks and locked wrong-base branch were confirmed; failed-CI and wrong-base merges were rejected. Paused rollback replay reconciled PR #1 with one PR read and zero writes. Owner approved Phase 4b. | Refreshed exact-head CI `43247992184` passed |
 
 ### Fresh-user walkthrough transcript
 
@@ -52,4 +52,4 @@ The private synthetic fixture used real Actions checks, an up-to-date base check
 - In a simulated same-journal rollback with the real downstream adapter, the candidate upgraded the prior unversioned journal while switched off and retained retry and lane records. It reconciled a seeded pending merge with one PR read and recorded the confirmed merge time. The previous pin then read that reconciled versioned journal in status and dry run, showed the lane again, and preserved the merge time and records in a stopped tick. Neither version attempted a remote write.
 - Restored the original engine import at the previous tracked source pin. The restored pin passed all 118 selected dry-run, lane and pending-lane cases. The existing downstream timer stays pinned.
 
-Owner completion and preview approval are pending. The license and publication decisions remain with the owner.
+Owner walkthrough, permissions, rollback, and preview checks are complete. MIT is the selected release license. Repository visibility and first publication remain owner-controlled.

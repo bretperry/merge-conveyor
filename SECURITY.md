@@ -18,5 +18,5 @@ Only the latest release of `merge-conveyor` gets fixes.
 
 ## Scope
 
-`merge-conveyor` is source-available software under the Functional Source License (see `LICENSE`).
+`merge-conveyor` is distributed under the MIT License (see `LICENSE`).
 Bugs in your own configuration, or in tools it runs on your behalf, are outside its scope.

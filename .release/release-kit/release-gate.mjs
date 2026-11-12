@@ -17,7 +17,7 @@
 //   1 shape    HEAD exists; no symlink or submodule; no gitleaks config or ignore file (they would steer the scan); no export-ignore or
 //              export-subst attribute (git archive would drop or rewrite a file the scan reads); no refs/replace ref (it hides a commit);
 //              no binary file, in the tree or in any commit, that was not named as binary (gitleaks skips binaries)
-//   2 kit      LICENSE is the official template with only the year and licensor filled; no {{…}} is left in a kit file; package.json, if there, says "license": "FSL-1.1-MIT"
+//   2 kit      LICENSE is the official template with only the year and licensor filled; no {{…}} is left in a kit file; package.json, if there, says "license": "MIT"
 //   3 terms    HARNESS_DENYLIST over every file in every commit (all encodings), every path ever committed, every commit message and identity,
 //              every ref name, every annotated tag (name, tagger, message). A report names a term by its number, never a path or ref name.
 //   4 paths    generic home folders and runner labels (PATH_TERMS); private machine names belong only in HARNESS_DENYLIST.
@@ -188,7 +188,7 @@ const kitStep = (dir, tree, values) => {
   const lines = [];
   const license = blobAt(dir, LICENSE_PATH);
   if (license === null) lines.push(`${LICENSE_PATH} is missing`);
-  else if (license.toString("utf8") !== renderKitFile(LICENSE_PATH, values)) lines.push(`${LICENSE_PATH} is not the FSL-1.1-MIT template with only the year and licensor filled (the terms are never edited)`);
+  else if (license.toString("utf8") !== renderKitFile(LICENSE_PATH, values)) lines.push(`${LICENSE_PATH} is not the MIT template with only the year and licensor filled (the terms are never edited)`);
   for (const path of Object.keys(KIT_FILES)) {
     const text = blobAt(dir, path)?.toString("utf8");
     if (text === undefined) lines.push(`${path} is missing`);
@@ -202,7 +202,7 @@ const kitStep = (dir, tree, values) => {
     } catch {
       lines.push("package.json is not valid JSON");
     }
-    if (declared !== "FSL-1.1-MIT") lines.push('package.json must say "license": "FSL-1.1-MIT"');
+    if (declared !== "MIT") lines.push('package.json must say "license": "MIT"');
   }
   return step("kit", lines);
 };

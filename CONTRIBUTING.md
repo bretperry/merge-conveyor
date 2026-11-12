@@ -1,8 +1,7 @@
 # Contributing
 
-`merge-conveyor` is source-available (see `LICENSE`), and **outside pull requests are not accepted yet**.
-The maintainer needs a contributor agreement in place before merging code from anyone else, so the
-project can still be relicensed. Until that exists, a pull request from outside will be closed unread.
+`merge-conveyor` is distributed under the MIT License (see `LICENSE`), and **outside pull requests are not accepted yet**.
+The maintainer needs a contributor agreement in place before merging code from anyone else, to establish clear rights to accept outside contributions. Until that exists, a pull request from outside will be closed unread.
 
 What helps now:
 
