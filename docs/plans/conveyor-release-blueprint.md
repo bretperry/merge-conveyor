@@ -20,9 +20,9 @@ Conveyor should give maintainers and agents a reliable way to see what is waitin
 | 1 | Harden merge, state, and recovery | 0 | deep (xhigh) | landed (#1); farrier passed; dynamite passed after fixes; Package gate passed at 7cc9bf8; live checks scheduled for Phase 4a |
 | 2 | Ship the CLI, queue, and typed API | 1 | workhorse (high) | landed (#3); farrier passed; dynamite passed; Package gate passed |
 | 3 | Write public docs and clean up comments | 2 | workhorse (medium) | landed (#4); farrier passed; Package gate passed |
-| 4a | Rehearse install, upgrade, and release | 3 | deep (high) | running; held by codex/conveyor-phase-4a |
-| 4b | Polish CLI and docs | 4a; preview approved | workhorse (medium) | |
-| 5 | Make public and publish | 4b; license decided | — (human) | |
+| 4a | Rehearse install, upgrade, and release | 3 | deep (high) | landed (#5); owner walkthrough merged synthetic #2 at `e618957`; strict permissions and paused rollback verified; preview approved |
+| 4b | Polish CLI and docs | 4a; preview approved | workhorse (medium) | running; held by codex/conveyor-phase-4b |
+| 5 | Make public and publish | 4b; license decided | — (human) | license decided: MIT; visibility and first publish pending owner |
 
 Suggested Codex assignments: GPT-6.1 Sol Extra High for phases 0 and 1, Sol High for phases 2 and 4a, Terra Medium for phases 3 and 4b. Use Terra High as a fresh user during phase 4a.
 
@@ -131,9 +131,9 @@ Expose last successful tick, last action, blocker, retry time, and state health 
 
 ## Decisions and human checks
 
-- **Release license:** Owner decides whether to retain FSL-1.1-MIT and label the release source-available, or choose an OSI-approved license for launch. Match LICENSE, package metadata, contribution policy, and the release gate.
+- **Release license:** Owner chose MIT on 2026-11-12. Match LICENSE, package metadata, contribution policy, and the release gate.
 - **Contract:** Owner reviews proposed CLI names, queue output, and which policy hooks are public in phase 0. Resolve merge methods, branch rule prerequisites, credential roles, and compatibility needs before freezing the interface.
-- **Preview:** Owner approves the installed CLI and documentation from phase 4a before phase 4b.
+- **Preview:** Owner approved the installed CLI and documentation on 2026-11-12 before phase 4b.
 - **Publish:** Owner approves visibility and the first npm release after rehearsing install, rollback, and the package and history checks.
 
 ## Phase 0 — Settle scope and public contract
