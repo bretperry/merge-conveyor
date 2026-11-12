@@ -30,6 +30,9 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: lts/*
+      - name: Run package tests
+        if: github.event_name == 'pull_request'
+        run: npm test
       - name: Install gitleaks
         # Pin the module; the checksum database verifies source and transitive dependencies.
         # Explicit settings prevent an ambient Go configuration disabling verification.

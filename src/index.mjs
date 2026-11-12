@@ -2,44 +2,19 @@
 // Used by: the conveyor CLI and the package tests.
 // Exports: createConveyor.
 import { spawnSync } from "node:child_process";
-import { appendFileSync, existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 
-import { latestPerCheck } from "./merge-checks.mjs";
-import { ciVerdict } from "./ci.mjs";
-const parseJson = (text) => {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
-};
+import { checkRows, ciVerdict } from "./ci.mjs";
+import { hasStrictChecks, isSha, MERGE_METHODS, mergePull, parseJson, readMerge, readPull, updatePull } from "./github.mjs";
+import { readState, takeLock, writeState } from "./state.mjs";
 
 const short = (sha) => (sha || "?").slice(0, 7);
-
-// Rename is atomic, so a crash mid-write can't leave half a file for the next tick to read.
-const writeAtomic = (path, text) => {
-  const temp = `${path}.${process.pid}.tmp`;
-  writeFileSync(temp, text);
-  renameSync(temp, path);
-};
 
 // Nearest-rank percentile of a list of numbers.
 const percentile = (values, p) => values.toSorted((a, b) => a - b)[Math.ceil((p / 100) * values.length) - 1];
 
 const minutes = (value) => (value < 120 ? `${Math.round(value)}m` : `${(value / 60).toFixed(1)}h`);
-
-const pidAlive = (pid) => {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    // EPERM: it exists, under another user.
-    return error.code === "EPERM";
-  }
-};
-
-const lockText = (now) => JSON.stringify({ pid: process.pid, at: now.toISOString() });
 
 const hourOf = (now) => now.toISOString().slice(0, 13);
 
@@ -63,6 +38,10 @@ const validateConfig = (config) => {
 
   object(config, "config");
   for (const field of ["base", "baseWorkflow", "switchVariable", "clearedContext", "stateName"]) string(config[field], field);
+  ensure(config.stateName === basename(config.stateName) && !/[\\/]/.test(config.stateName), "stateName", "a filename stem");
+  ensure(config.mergeMethod === undefined || MERGE_METHODS.includes(config.mergeMethod), "mergeMethod", "merge, squash, or rebase");
+  ensure(config.autoUpdate === undefined || typeof config.autoUpdate === "boolean", "autoUpdate", "a boolean");
+  ensure(config.clearancePublisherId === undefined || (Number.isSafeInteger(config.clearancePublisherId) && config.clearancePublisherId > 0), "clearancePublisherId", "a positive GitHub user ID");
   object(config.release, "release");
   string(config.release.branch, "release.branch");
   object(config.ageAlarms, "ageAlarms");
@@ -79,7 +58,7 @@ const validateConfig = (config) => {
 
 export const createConveyor = (config) => {
   validateConfig(config);
-  const { approved, changeDigest, gitDir, heldDigest, readHeld, activeUntil, commando, DOCS_ONLY, heldBy, isGateContext, wrangleMerge, approvedWork, approvalClock } = config.adapters;
+  const { approved, gitDir, heldDigest, readHeld, activeUntil, commando, heldBy, isGateContext, wrangleMerge, approvedWork, approvalClock } = config.adapters;
   const { pokeHours: APPROVED_POKE_HOURS, tellHours: APPROVED_TELL_HOURS } = config.ageAlarms;
   // Knobs. The commit status that says a head passed its reviews.
   const CLEARED_CONTEXT = config.clearedContext;
@@ -90,6 +69,9 @@ export const createConveyor = (config) => {
   const DEV_WORKFLOW = config.baseWorkflow;
   const BASE_BRANCH = config.base;
   const SHIP_BRANCH = config.release.branch;
+  const MERGE_METHOD = config.mergeMethod ?? "merge";
+  const AUTO_UPDATE = config.autoUpdate ?? false;
+  const CLEARANCE_PUBLISHER = config.clearancePublisherId;
   // How long before commando's end to warn.
   const COMMANDO_WARN_HOURS = 1;
   // A tick is checked as green first, so this only bounds a stale draft run; commando's own default is 55.
@@ -102,11 +84,7 @@ export const createConveyor = (config) => {
   const MERGE_RETRY_MINUTES = 30;
   // How long one PR's update may hold the queue: its head moving, then its CI finishing. Past it, an alarm and the queue goes on.
   const UPDATE_FLIGHT_MINUTES = 60;
-  // GitHub's compare API lists at most this many files, so a list this long may hide a code path.
-  const COMPARE_MAX_FILES = 300;
-  // A live PID that hasn't beaten for this long is a reused PID or a hung tick.
-  const LOCK_HUNG_MINUTES = 120;
-  const LOCK_BEAT_MS = 30_000;
+  const LOCK_HUNG_MINUTES = 120; // Legacy export. A live worker now keeps its lock until exit.
   const REPORT_DAYS = 7;
   // The target this repo's flow is measured against: approved to on dev.
   const TARGET_P50_MINUTES = 30;
@@ -130,22 +108,22 @@ export const createConveyor = (config) => {
   const HOUR = 3600 * 1000;
   const MINUTE = 60 * 1000;
 
-  const defaultRun = (argv, timeout = RUN_TIMEOUT_MS) => {
-    const result = spawnSync(argv[0], argv.slice(1), { encoding: "utf8", timeout });
+  const defaultRun = (argv, timeout = RUN_TIMEOUT_MS, cwd) => {
+    const result = spawnSync(argv[0], argv.slice(1), { encoding: "utf8", timeout, killSignal: "SIGKILL", cwd });
     return { status: result.status ?? 1, stdout: result.stdout ?? "", stderr: result.stderr || (result.error?.message ?? "") };
   };
 
   // Runs an owner's command. Data goes in on stdin and env, never into the command line, because a PR
   // title or check name is text anyone with a branch can choose. Returns "" or what went wrong.
   const defaultHook = (command, input, env) => {
-    const result = spawnSync("/bin/sh", ["-c", command], { input, env, encoding: "utf8", timeout: HOOK_TIMEOUT_MS });
+    const result = spawnSync("/bin/sh", ["-c", command], { input, env, encoding: "utf8", timeout: HOOK_TIMEOUT_MS, killSignal: "SIGKILL" });
     if (result.error) return result.error.message;
     return result.status === 0 ? "" : result.stderr.trim() || `exit ${result.status}`;
   };
 
   // Whether a command only reads. `gh api` writes when given a method, a field or a body; the other
   // `gh` verbs are listed by name, so a new one is refused until someone decides it reads.
-  const GH_READS = new Set(["pr list", "pr view", "run list"]);
+  const GH_READS = new Set(["pr list", "pr view", "pr checks", "pr diff", "run list"]);
   const GH_API_WRITES = /^(-X|--method|-f|-F|--field|--raw-field|--input)/;
   const readsOnly = (argv) => argv[0] !== "gh" || GH_READS.has(argv.slice(1, 3).join(" ")) || (argv[1] === "api" && !argv.some((arg) => GH_API_WRITES.test(arg)));
 
@@ -153,28 +131,34 @@ export const createConveyor = (config) => {
 
 
   // The real status only: a check run anyone's workflow can name the same, and it isn't a review's mark.
-  const isClearedStatus = ({ __typename: type, context }) => type === "StatusContext" && context === CLEARED_CONTEXT;
+  const isClearedStatus = ({ __typename: type, context }) => type === "StatusContext" && typeof context === "string" && context.toLowerCase() === CLEARED_CONTEXT.toLowerCase();
 
-  // One PR's class from its own fields. The real gate is commando's merge; this only decides whether to try.
-  //   failure   a red check or a conflict on a PR that is ready or cleared: a session must act
-  //   draft     not asked to land yet     reviews   ready, but no cleared status on this head
-  //   running   cleared, checks going     cleared   cleared and green: try to merge
+  // Queue candidates need a full head, an actual clearance status, and nonempty green CI.
   const classify = (pr) => {
-    // A review gate is a status, not CI: commando's merge reads those, and this says nothing about them.
-    const rows = latestPerCheck((pr.statusCheckRollup ?? []).filter(({ __typename: type, context }) => !(type === "StatusContext" && isGateContext(context))).map((row) => ({ ...row, name: row.name || row.context, workflow: row.workflowName })));
-    const status = rows.find(isClearedStatus);
-    const clearedRow = status?.state === "SUCCESS" ? status : null;
-    const checks = rows.filter((row) => !isClearedStatus(row));
-    const failing = rows.filter((row) => ciVerdict([row]) === "red").map((row) => row.name);
-    const checksDone = checks.length > 0 && checks.every((row) => ciVerdict([row]) !== "pending");
-    const base = { number: pr.number, title: pr.title ?? "", head: pr.headRefOid ?? "", clearedAt: clearedRow?.startedAt ?? null, fork: pr.isCrossRepository !== false, checksDone };
-    const pushed = !pr.isDraft || Boolean(clearedRow);
-    if (pushed && failing.length > 0) return { ...base, kind: "failure", failure: "failing", detail: failing.join(", ") };
-    if (pushed && pr.mergeable === "CONFLICTING") return { ...base, kind: "failure", failure: "conflict", detail: `conflicts with ${BASE_BRANCH}` };
-    if (pr.isDraft) return { ...base, kind: "draft", detail: clearedRow ? "cleared, but still a draft: its heavy checks haven't run" : "draft" };
-    if (!clearedRow) return { ...base, kind: "reviews", detail: "ready; no cleared status on this head" };
-    if (checks.length === 0 || checks.some((row) => ciVerdict([row]) !== "green")) return { ...base, kind: "running", detail: "cleared; checks still running" };
+    const rows = checkRows(pr.statusCheckRollup);
+    const clearedRow = rows?.find(isClearedStatus);
+    const clearedAt = clearedRow?.state === "SUCCESS" && Number.isFinite(Date.parse(clearedRow.startedAt)) ? clearedRow.startedAt : null;
+    const checks = rows?.filter((row) => !isClearedStatus(row) && !(row.__typename === "StatusContext" && isGateContext(row.context)));
+    const verdict = rows ? ciVerdict(checks) : "unknown";
+    const base = { number: pr.number, title: pr.title ?? "", head: pr.headRefOid ?? "", clearedAt, fork: pr.isCrossRepository !== false, checksDone: checks?.length > 0 && checks.every((row) => ["green", "red"].includes(ciVerdict([row]))) };
+    if ((!pr.isDraft || clearedAt) && verdict === "red") return { ...base, kind: "failure", failure: "failing", detail: checks.filter((row) => ciVerdict([row]) === "red").map((row) => row.name).join(", ") };
+    if ((!pr.isDraft || clearedAt) && pr.mergeable === "CONFLICTING") return { ...base, kind: "failure", failure: "conflict", detail: `conflicts with ${BASE_BRANCH}` };
+    if (pr.isDraft !== false) return { ...base, kind: "draft", detail: clearedAt ? "cleared, but still a draft: its heavy checks haven't run" : "draft" };
+    if (verdict === "unknown" || !isSha(base.head) || pr.mergeable !== "MERGEABLE") return { ...base, kind: "running", detail: "checks or mergeability unavailable" };
+    if (!clearedAt) return { ...base, kind: "reviews", detail: "ready; no cleared status on this head" };
+    if (verdict !== "green") return { ...base, kind: "running", detail: "cleared; checks still running" };
     return { ...base, kind: "cleared", detail: "cleared and green" };
+  };
+
+  // Existing adapters may establish trust in their configured context. Standalone deployments can
+  // additionally pin the publisher. Only the latest status for the context can authorize a write.
+  const clearanceProblem = (head, run) => {
+    if (!CLEARANCE_PUBLISHER) return "";
+    const result = run(["gh", "api", `repos/{owner}/{repo}/commits/${head}/statuses?per_page=100`]);
+    const statuses = result.status === 0 ? parseJson(result.stdout) : null;
+    if (!Array.isArray(statuses) || statuses.some((status) => typeof status?.context !== "string")) return "can't read clearance publisher";
+    const latest = statuses.find((status) => status.context.toLowerCase() === CLEARED_CONTEXT.toLowerCase());
+    return latest?.state === "success" && latest.creator?.id === CLEARANCE_PUBLISHER ? "" : "no clearance from the trusted publisher on this head";
   };
 
   // Whether the switch reads `on`. A 404 is "not set"; any other failure (a 502, a timeout, no network) is
@@ -195,7 +179,7 @@ export const createConveyor = (config) => {
   const devTip = (run) => {
     const result = run(["gh", "api", `repos/{owner}/{repo}/commits/${BASE_BRANCH}`, "--jq", ".sha"]);
     const sha = result.stdout.trim();
-    return result.status === 0 && sha ? { sha } : { error: `can't read ${BASE_BRANCH}'s tip: ${result.stderr.trim() || "bad output"}` };
+    return result.status === 0 && isSha(sha) ? { sha } : { error: `can't read ${BASE_BRANCH}'s tip: ${result.stderr.trim() || "bad output"}` };
   };
 
   // Whether `dev` is green now: its CI workflow's last push run succeeded, at the tip or with only
@@ -206,29 +190,30 @@ export const createConveyor = (config) => {
     if (!Array.isArray(runs)) return { green: false, unreadable: true, why: `can't read ${BASE_BRANCH}'s runs: ${result.stderr.trim() || "bad output"}` };
     if (runs.length === 0) return { green: false, why: `${BASE_BRANCH} has no ${DEV_WORKFLOW} run on a push` };
     const [last] = runs;
+    if (!isSha(last?.headSha) || typeof last.status !== "string") return { green: false, unreadable: true, why: `can't read ${BASE_BRANCH}'s last run` };
     if (last.status !== "completed") return { green: false, why: `${BASE_BRANCH}'s run at ${short(last.headSha)} is still going (${last.status})` };
     if (last.conclusion !== "success") return { green: false, red: last.headSha, why: `${BASE_BRANCH}'s run at ${short(last.headSha)} ended ${last.conclusion}` };
     const tip = devTip(run);
     if (tip.error) return { green: false, unreadable: true, why: tip.error };
-    if (tip.sha === last.headSha) return { green: true };
-    const compare = run(["gh", "api", `repos/{owner}/{repo}/compare/${last.headSha}...${BASE_BRANCH}`, "--jq", "[.commits[].commit.message]"]);
-    const messages = compare.status === 0 ? parseJson(compare.stdout) : null;
-    if (!Array.isArray(messages)) return { green: false, unreadable: true, why: `can't compare ${BASE_BRANCH}'s tip with its last run: ${compare.stderr.trim() || "bad output"}` };
-    return messages.every((message) => SKIPS_CI.test(message)) ? { green: true } : { green: false, why: `${BASE_BRANCH}'s tip ${short(tip.sha)} has no finished ${DEV_WORKFLOW} run yet` };
+    if (tip.sha === last.headSha) return { green: true, sha: tip.sha };
+    const compare = run(["gh", "api", `repos/{owner}/{repo}/compare/${last.headSha}...${tip.sha}`, "--jq", "[.status, .ahead_by, [.commits[].commit.message]]"]);
+    const read = compare.status === 0 ? parseJson(compare.stdout) : null;
+    if (!Array.isArray(read) || !Array.isArray(read[2]) || read[2].some((message) => typeof message !== "string")) {
+      return { green: false, unreadable: true, why: `can't compare ${BASE_BRANCH}'s tip with its last run` };
+    }
+    const [status, ahead, messages] = read;
+    if (status === "ahead" && ahead > 0 && ahead === messages.length && messages.every((message) => SKIPS_CI.test(message))) return { green: true, sha: tip.sha };
+    return { green: false, why: `${BASE_BRANCH}'s tip ${short(tip.sha)} has no finished ${DEV_WORKFLOW} run yet` };
   };
 
-  // Whether `dev` has moved outside the docs-only list since this head's merge-base, so its CI never ran
-  // against what it would land on. A rename counts under either name. A list that may be cut short, or
-  // commits with no list, count as moved; anything unreadable is an error, never "not stale".
-  const staleness = (head, run) => {
-    const result = run(["gh", "api", `repos/{owner}/{repo}/compare/${head}...${BASE_BRANCH}`, "--jq", "[.ahead_by, [.files[] | [.filename, .previous_filename // \"\"]]]"]);
-    const read = result.status === 0 ? parseJson(result.stdout) : null;
-    if (!Array.isArray(read) || !Number.isInteger(read[0]) || !Array.isArray(read[1])) return { error: `can't compare ${short(head)} with ${BASE_BRANCH}: ${result.stderr.trim() || "bad output"}` };
-    const [ahead, files] = read;
-    if (ahead === 0) return { stale: false };
-    if (files.length === 0 || files.length >= COMPARE_MAX_FILES) return { stale: true, why: `${BASE_BRANCH} moved and the compare can't list every file` };
-    const code = files.flat().find((path) => path && !DOCS_ONLY.test(path));
-    return code ? { stale: true, why: `${BASE_BRANCH} moved in ${code}` } : { stale: false };
+  // Compare immutable commits. Strict checks also enforce this at GitHub's merge boundary.
+  const staleness = (head, run, baseSha) => {
+    const tip = baseSha ? { sha: baseSha } : devTip(run);
+    if (tip.error) return tip;
+    const result = run(["gh", "api", `repos/{owner}/{repo}/compare/${head}...${tip.sha}`, "--jq", ".ahead_by"]);
+    const ahead = result.status === 0 ? parseJson(result.stdout) : null;
+    if (!Number.isSafeInteger(ahead) || ahead < 0) return { error: `can't compare ${short(head)} with ${BASE_BRANCH}` };
+    return ahead > 0 ? { stale: true, why: `${BASE_BRANCH} advanced by ${ahead} commit(s)` } : { stale: false };
   };
 
   // The ship freeze: a push to `dev` moves the open ship PR's head and cancels its checks.
@@ -242,22 +227,27 @@ export const createConveyor = (config) => {
   // Why this clone can't be trusted to merge, or "". The hold list and the merge path run from its
   // files with the token, so it must be exactly `dev`'s tip: not another branch, not behind, not edited.
   const cloneProblem = (cwd, run) => {
-    const branch = run(["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"]).stdout.trim();
-    if (branch !== BASE_BRANCH) return `this clone is on ${branch || "no branch"}, not ${BASE_BRANCH}`;
-    // No optional locks: a plain `git status` may refresh the index, and a dry run must write nothing.
-    if (run(["git", "--no-optional-locks", "-C", cwd, "status", "--porcelain"]).stdout.trim()) return "this clone has uncommitted changes";
+    const branch = run(["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"]);
+    if (branch.status !== 0) return "can't read the worker's branch";
+    if (branch.stdout.trim() !== BASE_BRANCH) return `this clone is on ${branch.stdout.trim() || "no branch"}, not ${BASE_BRANCH}`;
+    const status = run(["git", "--no-optional-locks", "-C", cwd, "status", "--porcelain"]);
+    if (status.status !== 0) return "can't read the worker's checkout status";
+    if (status.stdout.trim()) return "this clone has uncommitted changes";
     const tip = devTip(run);
     if (tip.error) return tip.error;
-    const local = run(["git", "-C", cwd, "rev-parse", "HEAD"]).stdout.trim();
-    return local === tip.sha ? "" : `this clone is at ${short(local)}, which isn't ${BASE_BRANCH}'s tip ${short(tip.sha)}`;
+    const local = run(["git", "-C", cwd, "rev-parse", "HEAD"]);
+    if (local.status !== 0 || !isSha(local.stdout.trim())) return "can't read the worker's HEAD";
+    return local.stdout.trim() === tip.sha ? "" : `this clone is at ${short(local.stdout.trim())}, which isn't ${BASE_BRANCH}'s tip ${short(tip.sha)}`;
   };
 
-  // The hold classes still open for this PR, or the read's error, kept apart: a failed read says nothing
-  // about holds. An early look only, so a hold costs one alarm instead of a log line in commando's
-  // report every 5 minutes; commando re-reads it at the merge.
-  const holdsNow = (dir, number, now, run) => {
-    const state = readHeld(String(number), run);
-    return state.error ? { error: state.error } : { classes: openHolds(dir, number, now, state) };
+  const heldState = (pr, run) => {
+    const state = readHeld(String(pr.number), run);
+    if (state?.error) return { error: state.error };
+    if (state?.head !== pr.head || !Array.isArray(state.paths) || state.paths.length === 0 ||
+      !state.paths.every((path) => typeof path === "string" && path.length > 0) || !Array.isArray(state.files) || state.files.length === 0) {
+      return { error: `can't verify held paths for #${pr.number} at ${short(pr.head)}` };
+    }
+    return state;
   };
 
   const openHolds = (dir, number, now, state) => heldBy(state.paths).filter((why) => !approved(dir, now, { pr: String(number), scope: `hold:${why}`, head: state.head, digest: heldDigest(state.files, why) }));
@@ -280,78 +270,42 @@ export const createConveyor = (config) => {
     // NaN is no clock; below zero is a note written after the merge, which measures nothing.
     const clocked = spans.filter((span) => span >= 0);
     const window = `${since.toISOString().slice(0, 10)} to ${now.toISOString().slice(0, 10)}`;
-    const times = clocked.length > 0 ? `approved to on dev p50 ${minutes(percentile(clocked, 50))}, p90 ${minutes(percentile(clocked, 90))}` : "no approval times";
+    const times = clocked.length > 0 ? `approved to on ${BASE_BRANCH} p50 ${minutes(percentile(clocked, 50))}, p90 ${minutes(percentile(clocked, 90))}` : "no approval times";
     return { line: `${basename(cwd)} ${window}: ${inWindow.length} merged, ${times} (target p50 ${minutes(TARGET_P50_MINUTES)}, p90 ${minutes(TARGET_P90_MINUTES)}), ${inWindow.length - clocked.length} with no clock` };
-  };
-
-  // `corrupt`: the file is there but unreadable. Its marks only repeat alarms, but the last merge's
-  // time may be in it too, so the tick that finds it doesn't merge.
-  const readState = (dir) => {
-    const path = join(dir, STATE_NAME);
-    const saved = existsSync(path) ? parseJson(readFileSync(path, "utf8")) : {};
-    return { state: { alarmed: {}, hooked: {}, attempts: {}, outbox: [], outboxDropped: 0, voided: {}, ...saved }, corrupt: saved === null };
-  };
-
-  const writeState = (dir, state, now) => {
-    const keep = now.getTime() - STATE_KEEP_DAYS * 24 * HOUR;
-    const fresh = (map) => Object.fromEntries(Object.entries(map).filter(([, at]) => Date.parse(at) >= keep));
-    const pruned = { ...state, alarmed: fresh(state.alarmed), hooked: fresh(state.hooked), attempts: fresh(state.attempts) };
-    writeAtomic(join(dir, STATE_NAME), `${JSON.stringify(pruned, null, 2)}\n`);
-  };
-
-
-
-  // True when this tick now holds the lock. A tick that died gives it up at once; a live one keeps it
-  // however long its merge runs, unless it has stopped beating (its PID was reused, or it hung).
-  const takeLock = (path, now) => {
-    try {
-      if (existsSync(path)) {
-        const text = readFileSync(path, "utf8");
-        const holder = parseJson(text);
-        if (holder && pidAlive(holder.pid) && now.getTime() - Date.parse(holder.at) < LOCK_HUNG_MINUTES * MINUTE) return false;
-        // Two ticks can both read it as stale. A rename lets one retire it; a tick that catches a newer
-        // lock instead, because the other already took over, puts it back and stands down.
-        const aside = `${path}.${process.pid}.stale`;
-        renameSync(path, aside);
-        if (readFileSync(aside, "utf8") !== text) {
-          renameSync(aside, path);
-          return false;
-        }
-        rmSync(aside);
-      }
-      writeFileSync(path, lockText(now), { flag: "wx" });
-      return true;
-    } catch {
-      return false;
-    }
   };
 
   const openPrs = (run) => {
     const result = run(["gh", "pr", "list", "--state", "open", "--base", BASE_BRANCH, "--limit", LIST_LIMIT, "--json", "number,title,isDraft,isCrossRepository,headRefOid,mergeable,statusCheckRollup"]);
     const prs = result.status === 0 ? parseJson(result.stdout) : null;
-    return Array.isArray(prs) ? { prs } : { error: `can't list open PRs: ${result.stderr.trim() || "bad output"}` };
+    return Array.isArray(prs) && prs.length < Number(LIST_LIMIT) &&
+      prs.every((pr) => Number.isSafeInteger(pr?.number) && pr.number > 0 && isSha(pr.headRefOid)) &&
+      new Set(prs.map((pr) => pr.number)).size === prs.length ? { prs } : { error: `can't list open PRs: ${result.stderr.trim() || "bad output"}` };
   };
 
-  // The merge itself: commando's own `merge`, so its switch, base rule, holds, pinned head and every
-  // wrangle-merge check all apply. The wrapper adds what a timer needs: the head commando pinned must be
-  // the head that was cleared, the wait is shorter, and `lastLook` runs right before `gh pr merge`.
-  const commandoMerge = (pr, { cwd, run, now, out, err, wrangle, lastLook }) =>
+  // Keep the existing merge adapters' review policy. Route their supported merge commands through
+  // the same direct writer, with the configured method and no auto-merge, queue or bypass option.
+  const commandoMerge = (pr, { cwd, run, now, out, err, wrangle, submit }) =>
     commando(["merge", String(pr.number)], {
-      cwd,
-      run,
-      now,
-      out,
-      err,
+      cwd, run, now, out, err,
       merge: (args, options) => {
         if (options.wantHead !== pr.head) {
-          err(`conveyor: #${pr.number} moved to ${short(options.wantHead)} after ${short(pr.head)} was cleared; refusing`);
+          err(`conveyor: #${pr.number}'s reviewed head changed; refusing`);
           return 1;
         }
-        return wrangle(["--wait-minutes", String(MERGE_WAIT_MINUTES), ...args], { ...options, run, beforeMerge: () => lastLook(pr) });
+        const guardedRun = (argv, timeout) => {
+          if (argv[0] === "gh" && argv[1] === "pr" && argv[2] === "merge") {
+            const headAt = argv.indexOf("--match-head-commit");
+            if (argv[3] === String(pr.number) && headAt >= 0 && argv[headAt + 1] === pr.head) return submit();
+          } else if (argv[0] === "gh" && argv[1] === "api" && argv.includes("--method") && argv.includes("PUT")) {
+            if (argv.includes(`repos/{owner}/{repo}/pulls/${pr.number}/merge`) && argv.includes(`sha=${pr.head}`)) return submit();
+          } else if (readsOnly(argv)) return run(argv, timeout);
+          return { status: 1, stdout: "", stderr: "merge adapter attempted an unsupported write" };
+        };
+        return wrangle(["--wait-minutes", String(MERGE_WAIT_MINUTES), ...args], {
+          ...options, run: guardedRun, base: BASE_BRANCH, releaseBranch: SHIP_BRANCH, mergeMethod: MERGE_METHOD,
+        });
       },
     });
-
-
 
   // Reads `dev`'s CI and alarms on it, every tick: a red `dev` matters with no PR waiting and commando off too.
   const watchDev = ({ run, now, state, alarm }) => {
@@ -367,86 +321,73 @@ export const createConveyor = (config) => {
     return dev;
   };
 
-  // After an update's head has moved: the clearance follows if the PR's own diff didn't change, and a held
-  // yes stands or falls by approve.mjs's rule. True once this head is settled; false to try again next tick.
-  const carryClearance = (pr, flight, { state, alarm, dir, now, run, act, seen }) => {
-    const after = readHeld(String(pr.number), run, { allModes: true });
-    if (after.error) {
-      alarm(`carry-read:${pr.number}:${hourOf(now)}`, `${after.error}, so #${pr.number}'s clearance can't follow its update yet. (${pr.title})`);
-      seen.unread.push(after.error);
-      return false;
+  // Read the specific PR, even if a list omits it. An unavailable outcome blocks all other writes.
+  // Legacy updates can settle here but their clearance is never carried to the new head.
+  const reconcile = ({ state, now, run, alarm, seen }) => {
+    const operation = state.operation ?? (state.updating && { ...state.updating, kind: "update", base: BASE_BRANCH });
+    if (!operation) return false;
+    const result = readMerge(run, operation.number);
+    const key = `${operation.kind}:${operation.number}@${operation.head}`;
+    const waiting = (reason, unreadable = false) => {
+      seen.why.push(reason);
+      if (unreadable) seen.unread.push(reason);
+      alarm(`reconcile:${key}:${hourOf(now)}`, reason);
+      return true;
+    };
+    if (!result) return waiting(`can't reconcile ${operation.kind} of #${operation.number} at ${short(operation.head)}`, true);
+    if (result.state === "MERGED" && result.baseRefName === BASE_BRANCH) {
+      if (!state.lastMergeAt || Date.parse(result.mergedAt) > Date.parse(state.lastMergeAt)) state.lastMergeAt = result.mergedAt;
     }
-    if (after.head !== pr.head) return false;
-    const digest = changeDigest(after.files);
-    const same = digest !== null && digest === flight.digest;
-    const diffNote = digest ? "own diff changed" : "own diff can't be fingerprinted";
-    const classes = openHolds(dir, pr.number, now, after);
-    if (classes.length > 0) {
-      state.voided[`${pr.number}@${pr.head}`] = { classes, at: now.toISOString() };
-      alarm(`held:${pr.number}@${pr.head}`, `#${pr.number}'s update from ${BASE_BRANCH} voided your yes for ${classes.join(", ")}: \`pnpm approve ${pr.number}\` in this clone after a look.${same ? "" : ` Its ${diffNote} too, so it needs a new review.`} (${pr.title})`);
-    } else if (!same) {
-      alarm(`carry:${pr.number}@${pr.head}`, `#${pr.number}'s ${diffNote} in its update from ${BASE_BRANCH}, so its clearance did not follow: it needs a new review, then \`conveyor clear\`. (${pr.title})`);
+    if (result.state === "MERGED" && (result.headRefOid !== operation.head || result.baseRefName !== operation.base)) {
+      alarm(`outcome:${key}`, `#${operation.number} merged with a different head or target than the recorded ${operation.kind}`);
     }
-    if (!same || pr.clearedAt) return true;
-    const problem = act.repost(pr, flight.head);
-    if (problem) alarm(`carry-post:${pr.number}@${pr.head}`, `can't re-post ${CLEARED_CONTEXT} on #${pr.number} at ${short(pr.head)}: ${problem}. (${pr.title})`);
-    return !problem;
-  };
-
-  // Whether the one update in flight still holds the queue: until its head has moved and its CI has
-  // finished, whatever came of its clearance, so no other PR is touched while it spends runners.
-  const updateInFlight = (context) => {
-    const { prs, state, alarm, now, seen } = context;
-    const flight = state.updating;
-    if (!flight) return false;
-    const pr = prs.find((p) => p.number === flight.number);
-    if (!pr) {
-      delete state.updating;
-      return false;
+    const age = now.getTime() - Date.parse(operation.at);
+    const limit = (operation.kind === "merge" ? MERGE_RETRY_MINUTES : UPDATE_FLIGHT_MINUTES) * MINUTE;
+    const unchanged = result.state === "OPEN" && result.headRefOid === operation.head && result.baseRefName === operation.base;
+    if (unchanged && age < limit) return waiting(`#${operation.number}'s ${operation.kind} at ${short(operation.head)} is still in flight`);
+    if (unchanged) seen.reconciledOpen = operation.number;
+    if (operation.kind === "update" && result.state === "OPEN" && !unchanged) {
+      const pr = readPull(run, operation.number, ["statusCheckRollup", "isDraft", "mergeable"]);
+      if (!pr || pr.headRefOid !== result.headRefOid || pr.baseRefName !== result.baseRefName) return waiting(`can't read #${operation.number}'s updated head`, true);
+      if (pr.baseRefName === operation.base && !classify(pr).checksDone && age < limit) return waiting(`#${operation.number}'s updated head is still waiting on checks`);
     }
-    const moved = pr.head !== flight.head;
-    if (moved && !flight.settled) flight.settled = carryClearance(pr, flight, context);
-    if (moved && flight.settled && pr.checksDone) {
-      delete state.updating;
-      return false;
-    }
-    if (now.getTime() - Date.parse(flight.at) >= UPDATE_FLIGHT_MINUTES * MINUTE) {
-      alarm(`update-stuck:${pr.number}@${pr.head}`, `#${pr.number}'s update from ${BASE_BRANCH} is still ${moved ? "not settled" : "not on its head"} after ${UPDATE_FLIGHT_MINUTES} minutes; the queue goes on without it. (${pr.title})`);
-      delete state.updating;
-      return false;
-    }
-    seen.why.push(`#${pr.number}'s update from ${BASE_BRANCH} is still in flight`);
-    return true;
-  };
-
-  // Updates one stale PR, its digest and the in-flight mark saved first: a crash mid-update still holds the queue, and the digest is what lets its clearance follow.
-  const startUpdate = (pr, { state, alarm, now, run, act, save, seen }) => {
-    const key = `${pr.number}@${pr.head}`;
-    state.attempts[`update:${key}`] = now.toISOString();
-    const before = readHeld(String(pr.number), run, { allModes: true });
-    const digest = before.error ? null : changeDigest(before.files);
-    if (!digest || before.head !== pr.head) {
-      alarm(`update-read:${key}`, `#${pr.number} is stale, but ${before.error ?? `its change at ${short(pr.head)} can't be fingerprinted`}, so it wasn't updated: its clearance couldn't follow. (${pr.title})`);
-      if (before.error) seen.unread.push(before.error);
-      return;
-    }
-    state.updating = { number: pr.number, head: pr.head, digest, at: now.toISOString() };
-    save(now);
-    const problem = act.update(pr);
-    if (!problem) return;
+    delete state.operation;
     delete state.updating;
-    if (/conflict/i.test(problem)) alarm(`failure:${key}:conflict`, `#${pr.number} at ${short(pr.head)}: conflicts with ${BASE_BRANCH}. It needs a session. (${pr.title})`);
-    else alarm(`update:${key}`, `#${pr.number}'s update from ${BASE_BRANCH} failed: ${problem}; retrying in ${MERGE_RETRY_MINUTES} minutes. (${pr.title})`);
+    return false;
   };
 
-  // At most one merge or update per tick, the oldest cleared first, a PR already current before any stale one, with `dev` green and no ship open before it.
-  // `land` makes the merge (a dry run's only records it); `seen` gets the reasons nothing landed, for a dry run to print.
-  const mergeOne = async ({ prs, dev, state, alarm, dir, now, run, clock, land, act, save, seen }) => {
-    if (updateInFlight({ prs, state, alarm, dir, now, run, act, seen })) return;
+  const preflight = (pr, kind, baseSha, { cwd, dir, run, clock }) => {
+    const ship = shipState(run);
+    if (ship.blocked) return ship.why;
+    const dev = devState(run);
+    if (!dev.green || dev.sha !== baseSha) return dev.why ?? `${BASE_BRANCH} moved during the tick`;
+    const clone = cloneProblem(cwd, run);
+    if (clone) return clone;
+    if (!hasStrictChecks(run, BASE_BRANCH)) return `can't verify strict required checks on ${BASE_BRANCH}`;
+    const held = heldState(pr, run);
+    if (held.error) return held.error;
+    const live = readPull(run, pr.number, ["baseRefOid", "isDraft", "mergeable", "mergeStateStatus", "isCrossRepository", "statusCheckRollup"]);
+    if (!live || live.state !== "OPEN" || live.baseRefName !== BASE_BRANCH || live.headRefOid !== pr.head || live.baseRefOid !== baseSha) return `#${pr.number}'s head or base changed or could not be verified`;
+    if (classify(live).kind !== "cleared") return `#${pr.number}'s clearance, CI or mergeability changed`;
+    if (kind === "merge" && live.mergeStateStatus !== "CLEAN") return `GitHub does not report #${pr.number} ready to merge`;
+    if (kind === "update" && live.isCrossRepository !== false) return `#${pr.number} cannot be updated from this repository`;
+    const clearance = clearanceProblem(pr.head, run);
+    if (clearance) return clearance;
+    // The owner can revoke consent while the earlier reads are running.
+    const switchNow = readSwitch(run);
+    if (!switchNow.on) return switchNow.why;
+    const at = clock();
+    const until = activeUntil(dir, at);
+    if (!(until instanceof Date) || !(until > at)) return "commando is off";
+    const classes = openHolds(dir, pr.number, at, held);
+    return classes.length > 0 ? `held without approval (${classes.join(", ")})` : "";
+  };
+
+  const mergeOne = async ({ prs, dev, state, alarm, cwd, dir, now, run, clock, land, save, seen, dry }) => {
     const retryAfter = now.getTime() - MERGE_RETRY_MINUTES * MINUTE;
     const candidates = prs
       .filter((pr) => pr.kind === "cleared" && !(Date.parse(state.attempts[`${pr.number}@${pr.head}`]) > retryAfter))
-      .toSorted((a, b) => Date.parse(a.clearedAt) - Date.parse(b.clearedAt));
+      .toSorted((a, b) => Number(a.number === seen.reconciledOpen) - Number(b.number === seen.reconciledOpen) || Date.parse(a.clearedAt) - Date.parse(b.clearedAt) || a.number - b.number);
     if (candidates.length === 0) {
       seen.why.push("no PR is cleared, green and past its retry wait");
       return;
@@ -457,10 +398,7 @@ export const createConveyor = (config) => {
     }
     const ship = shipState(run);
     if (ship.blocked) {
-      if (ship.error) {
-        alarm(`ship:${hourOf(now)}`, `${ship.why}. Nothing merges until it can tell.`);
-        seen.unread.push(ship.why);
-      }
+      if (ship.error) seen.unread.push(ship.why);
       seen.why.push(ship.why);
       return;
     }
@@ -468,69 +406,79 @@ export const createConveyor = (config) => {
       seen.why.push(dev.why);
       return;
     }
-    // Everything that can change during the wait, read again right before `gh pr merge`. An approval can
-    // run out in the wait too: wrangle-merge needs a minute of stable polls after commando has read it.
-    const lastLook = (pr) => {
+    const prepare = (pr, kind) => {
+      const reason = preflight(pr, kind, dev.sha, { cwd, dir, run, clock });
+      if (reason) {
+        seen.why.push(reason);
+        return reason;
+      }
+      if (dry) return "";
       const at = clock();
-      // The switch first: an owner who stops the conveyor during the wait stops this merge too.
-      const switchNow = readSwitch(run);
-      if (!switchNow.on) return switchNow.why;
-      if (!activeUntil(dir, at)) return "commando is off";
-      const shipNow = shipState(run);
-      if (shipNow.blocked) return shipNow.why;
-      const devNow = devState(run);
-      if (!devNow.green) return devNow.why;
-      const holds = holdsNow(dir, pr.number, at, run);
-      if (holds.error) return holds.error;
-      if (holds.classes.length > 0) return `held, with no approval in force (${holds.classes.join(", ")})`;
-      const moved = staleness(pr.head, run);
-      return moved.error ?? (moved.stale ? `#${pr.number} is stale: ${moved.why}` : "");
+      state.operation = { kind, number: pr.number, head: pr.head, base: BASE_BRANCH, baseSha: dev.sha, at: at.toISOString() };
+      const attempt = `${pr.number}@${pr.head}`;
+      state.attempts[kind === "update" ? `update:${attempt}` : attempt] = state.operation.at;
+      save(at);
+      return "";
     };
     let toUpdate = null;
     for (const pr of candidates) {
-      const holds = holdsNow(dir, pr.number, now, run);
-      if (holds.error) {
-        alarm(`hold-read:${pr.number}:${hourOf(now)}`, `${holds.error}, so #${pr.number} waits. (${pr.title})`);
-        seen.unread.push(holds.error);
-        seen.why.push(`#${pr.number} waits: ${holds.error}`);
+      const held = heldState(pr, run);
+      if (held.error) {
+        alarm(`hold-read:${pr.number}:${hourOf(now)}`, held.error);
+        seen.unread.push(held.error);
+        return;
+      }
+      const classes = openHolds(dir, pr.number, now, held);
+      if (classes.length > 0) {
+        alarm(`held:${pr.number}@${pr.head}`, `#${pr.number} waits for separate approval (${classes.join(", ")}). (${pr.title})`);
+        seen.why.push(`#${pr.number} is held (${classes.join(", ")}) with no approval in force`);
         continue;
       }
-      if (holds.classes.length > 0) {
-        alarm(`held:${pr.number}@${pr.head}`, `#${pr.number} is cleared and green but waits for you (${holds.classes.join(", ")}): \`pnpm approve ${pr.number}\` in this clone. (${pr.title})`);
-        seen.why.push(`#${pr.number} is held (${holds.classes.join(", ")}) with no approval in force`);
-        continue;
-      }
-      const moved = staleness(pr.head, run);
+      const moved = staleness(pr.head, run, dev.sha);
       if (moved.error) {
-        alarm(`stale-read:${pr.number}:${hourOf(now)}`, `${moved.error}, so #${pr.number} waits. (${pr.title})`);
+        alarm(`stale-read:${pr.number}:${hourOf(now)}`, moved.error);
         seen.unread.push(moved.error);
-        seen.why.push(`#${pr.number} waits: ${moved.error}`);
-        continue;
+        return;
       }
       if (moved.stale) {
         seen.why.push(`#${pr.number} is stale: ${moved.why}`);
-        if (pr.fork) alarm(`fork:${pr.number}@${pr.head}`, `#${pr.number} is stale (${moved.why}) and comes from a fork, so the conveyor can't update it. It needs a session. (${pr.title})`);
-        else if (!(Date.parse(state.attempts[`update:${pr.number}@${pr.head}`]) > retryAfter)) toUpdate ??= pr;
+        if (pr.fork) alarm(`fork:${pr.number}@${pr.head}`, `#${pr.number} is stale and comes from a fork; a session needs to update it. (${pr.title})`);
+        else if (AUTO_UPDATE && !(Date.parse(state.attempts[`update:${pr.number}@${pr.head}`]) > retryAfter)) toUpdate ??= pr;
         continue;
       }
-      state.attempts[`${pr.number}@${pr.head}`] = now.toISOString();
-      const code = await land(pr, lastLook);
-      if (code === 0) state.lastMergeAt = clock().toISOString();
-      else alarm(`merge:${pr.number}@${pr.head}`, `#${pr.number}'s merge at ${short(pr.head)} did not land (exit ${code}); retrying in ${MERGE_RETRY_MINUTES} minutes. (${pr.title})`);
+      if (dry) {
+        if (!prepare(pr, "merge")) seen.merge = pr;
+        return;
+      }
+      state.attempts[`${pr.number}@${pr.head}`] = clock().toISOString();
+      const code = await land(pr, () => {
+        if (state.operation) return { status: 1, stdout: "", stderr: "a write was already attempted this tick" };
+        const reason = prepare(pr, "merge");
+        return reason ? { status: 1, stdout: "", stderr: reason } : mergePull(run, pr.number, pr.head, MERGE_METHOD);
+      });
+      if (state.operation) reconcile({ state, now: clock(), run, alarm, seen });
+      else if (code !== 0) alarm(`merge:${pr.number}@${pr.head}`, `#${pr.number}'s merge was refused (exit ${code}); retrying in ${MERGE_RETRY_MINUTES} minutes. (${pr.title})`);
       return;
     }
-    if (toUpdate) startUpdate(toUpdate, { state, alarm, now, run, act, save, seen });
+    if (!toUpdate || prepare(toUpdate, "update")) return;
+    if (dry) {
+      seen.update = toUpdate;
+      return;
+    }
+    updatePull(run, toUpdate.number, toUpdate.head);
+    reconcile({ state, now: clock(), run, alarm, seen });
   };
 
   // One pass. Alarms and marks go through `tell`, `alarm` and `state`, which `tick` owns.
-  const pass = async ({ cwd, run, clock, env, hook, dir, now, state, corrupt, tell, alarm, save, land, act, seen, dry }) => {
+  const pass = async ({ cwd, run, clock, env, hook, dir, now, state, tell, alarm, save, land, seen, dry }) => {
     state.lastTickAt = now.toISOString();
 
     const stale = cloneProblem(cwd, run);
     if (stale) alarm(`stale:${hourOf(now)}`, `${stale}. Nothing merges from here until it is on ${BASE_BRANCH}'s tip.`);
     if (stale.startsWith("can't read")) seen.unread.push(stale);
 
-    const until = activeUntil(dir, now);
+    const consent = activeUntil(dir, now);
+    const until = consent instanceof Date && consent > now ? consent : null;
     Object.assign(seen, { stale, until });
     if (until && until.getTime() - now.getTime() <= COMMANDO_WARN_HOURS * HOUR) alarm(`commando-ending:${until.toISOString()}`, `commando ends at ${until.toISOString()}. \`pnpm commando on <hours>\` in this clone keeps the merges going.`);
 
@@ -538,6 +486,7 @@ export const createConveyor = (config) => {
     seen.dev = dev;
     if (dev.unreadable) seen.unread.push(dev.why);
 
+    const pending = reconcile({ state, now, run, alarm, seen });
     const listed = openPrs(run);
     if (listed.error) {
       alarm(`gh:${hourOf(now)}`, listed.error);
@@ -593,9 +542,8 @@ export const createConveyor = (config) => {
     // Saved before the merge: a merge can wait minutes, and a crash there mustn't repeat these alarms.
     save(now);
 
-    seen.blocked = !until ? "commando is off in this clone" : stale || (corrupt ? "its state file is unreadable" : "");
-    // A dry run goes on past what would stop a tick, to say which PR it would have merged.
-    if (!seen.blocked || dry) await mergeOne({ prs, dev, state, alarm, dir, now, run, clock, land, act, save, seen });
+    seen.blocked = !until ? "commando is off in this clone" : stale || (pending ? "a GitHub write is being reconciled" : "");
+    if (!seen.blocked) await mergeOne({ prs, dev, state, alarm, cwd, dir, now, run, clock, land, save, seen, dry });
     return 0;
   };
 
@@ -610,7 +558,7 @@ export const createConveyor = (config) => {
       return seen.switch.unreadable ? 1 : 0;
     }
     out(until ? `commando: on until ${until.toISOString()}, in this clone` : "commando: off in this clone, so a real tick would merge nothing");
-    out(`clone: ${stale?.startsWith("can't read") ? "?" : stale || "on dev's tip"}`);
+    out(`clone: ${stale?.startsWith("can't read") ? "?" : stale || `on ${BASE_BRANCH}'s tip`}`);
     out(`${BASE_BRANCH}: ${!dev ? "not read" : dev.green ? "green" : dev.unreadable ? "?" : `not green: ${dev.why}`}`);
     out(`open PRs: ${prs ? prs.length : "?"}`);
     for (const pr of prs ?? []) out(`  #${pr.number} ${pr.kind} at ${short(pr.head)}: ${pr.detail}`);
@@ -619,7 +567,6 @@ export const createConveyor = (config) => {
     for (const line of alarms) out(`  ${line}`);
     for (const line of hooks) out(`would run CONVEYOR_ON_FAILURE_COMMAND: ${line}`);
     for (const text of seen.unread) out(`? ${text}`);
-    if (seen.carry) out(`would re-post ${CLEARED_CONTEXT} on #${seen.carry.number} at ${short(seen.carry.head)}: its own diff is unchanged`);
     if (seen.update) out(`would update #${seen.update.number} at ${short(seen.update.head)} from ${BASE_BRANCH}, with a merge commit`);
     const merge = seen.merge ? `#${seen.merge.number} at ${short(seen.merge.head)} (${seen.merge.title})` : "";
     if (blocked) out(`a real tick would merge nothing: ${blocked}`);
@@ -642,13 +589,18 @@ export const createConveyor = (config) => {
     const run = dry ? readOnlyRun(realRun) : realRun;
     // First, before any other read: the switch decides whether anything else happens.
     const enabled = readSwitch(run);
-    const { state, corrupt } = readState(dir);
+    const path = join(dir, STATE_NAME);
+    const { state, corrupt } = readState(path);
+    if (corrupt) {
+      err(`conveyor: ${STATE_NAME} is unreadable or unsupported; resolve it before retrying`);
+      return REPORTED;
+    }
     const seen = { switch: enabled, why: [], unread: [], merge: null, blocked: "" };
     const alarms = [];
     const hooks = [];
     const logLine = (line) => appendFileSync(join(dir, LOG_NAME), `${clock().toISOString()} ${line}\n`);
     const save = (at) => {
-      if (!dry) writeState(dir, state, at);
+      if (!dry) writeState(path, state, at.getTime() - STATE_KEEP_DAYS * 24 * HOUR);
     };
     // One try per tick at a command that is down: each can take a minute, and the queue may be long.
     let down = false;
@@ -688,18 +640,7 @@ export const createConveyor = (config) => {
       }
     };
     const alarm = (key, line) => tell(key, `conveyor alarm: ${line}`);
-    // The merge, and the failure hook: a dry run only notes that each would have happened.
-    const land = dry ? async (pr) => ((seen.merge = pr), 0) : (pr, lastLook) => commandoMerge(pr, { cwd, run, now: clock(), out, err, wrangle, lastLook });
-    // The update and the re-post: the same, so a dry run's `gh` never sees a write.
-    const act = dry
-      ? { update: (pr) => ((seen.update = pr), ""), repost: (pr) => ((seen.carry = pr), "") }
-      : {
-          update: (pr) => {
-            const result = realRun(["gh", "pr", "update-branch", String(pr.number)]);
-            return result.status === 0 ? "" : result.stderr.trim() || `exit ${result.status}`;
-          },
-          repost: (pr, from) => postCleared(realRun, pr.head, `Carried from ${short(from)}: its own diff is unchanged`),
-        };
+    const land = (pr, submit) => commandoMerge(pr, { cwd, run, now: clock(), out, err, wrangle, submit });
     const failureHook = dry ? (_command, _input, hookEnv) => (hooks.push(`#${hookEnv.CONVEYOR_PR} at ${short(hookEnv.CONVEYOR_HEAD)}`), "") : hook;
     const report = () => dryReport(seen, { out, alarms, hooks, queued: state.outbox.length });
     // The switch isn't on: no merge, no hook. An off or unset switch is a choice, so it is told to stdout and
@@ -719,13 +660,15 @@ export const createConveyor = (config) => {
     try {
       if (dry) {
         if (!enabled.on) return report();
-      } else if (!enabled.on) return stop();
-      else if (state.stopped) {
+      } else if (!enabled.on) {
+        reconcile({ state, now, run, alarm, seen });
+        return stop();
+      } else if (state.stopped) {
         logLine(`conveyor: ${ENABLED_VARIABLE} is "${ENABLED_VALUE}" again; acting`);
         delete state.stopped;
       }
       if (!dry) flush();
-      const code = await pass({ cwd, run, clock, env, hook: failureHook, dir, now, state, corrupt, tell, alarm, save, land, act, seen, dry });
+      const code = await pass({ cwd, run, clock, env, hook: failureHook, dir, now, state, tell, alarm, save, land, seen, dry });
       return dry ? report() : code;
     } catch (error) {
       if (dry) {
@@ -742,10 +685,15 @@ export const createConveyor = (config) => {
   const status = ({ cwd, run, now, out, err, dir }) => {
     out(switchLine(readSwitch(run)));
     const until = activeUntil(dir, now);
-    const { state } = readState(dir);
+    const { state, corrupt } = readState(join(dir, STATE_NAME));
+    if (corrupt) {
+      err(`conveyor: ${STATE_NAME} is unreadable or unsupported`);
+      return 1;
+    }
     out(until ? `commando on until ${until.toISOString()}, in this clone` : "commando off in this clone (the switch is per clone; the timer reads its own)");
     out(state.lastTickAt ? `last tick ${state.lastTickAt}` : "no tick yet in this clone: is the timer installed, and is this its clone?");
-    out(`clone: ${cloneProblem(cwd, run) || "on dev's tip"}`);
+    out(`clone: ${cloneProblem(cwd, run) || `on ${BASE_BRANCH}'s tip`}`);
+    if (state.operation) out(`${state.operation.kind} in flight: #${state.operation.number} at ${short(state.operation.head)}, since ${state.operation.at}`);
     if (state.updating) out(`update in flight: #${state.updating.number} from ${short(state.updating.head)}, since ${state.updating.at}`);
     for (const [key, { classes }] of Object.entries(state.voided)) {
       const [number, head] = key.split("@");
@@ -785,7 +733,7 @@ export const createConveyor = (config) => {
       err(`conveyor: #${number} is ${pr.state} into ${pr.baseRefName}; only an open PR into ${BASE_BRANCH} can be cleared.`);
       return 1;
     }
-    if (!pr.headRefOid?.startsWith(head)) {
+    if (pr.headRefOid !== head) {
       err(`conveyor: #${number}'s head is ${short(pr.headRefOid)}, not ${head}; review the new head, then clear it.`);
       return 1;
     }
@@ -801,7 +749,7 @@ export const createConveyor = (config) => {
   const USAGE = "usage: conveyor.mjs tick [--dry-run] | status | report [--days N] | clear <pr> <head sha>";
 
   // Returns the exit code: 0 done, 1 gh failed or refused, 2 usage, 3 a tick failed and alarmed.
-  const main = async (argv, { cwd = process.cwd(), run = defaultRun, clock = () => new Date(), out = console.log, err = console.error, env = process.env, hook = defaultHook, wrangle = wrangleMerge, beatMs = LOCK_BEAT_MS } = {}) => {
+  const main = async (argv, { cwd = process.cwd(), run = (argv, timeout) => defaultRun(argv, timeout, cwd), clock = () => new Date(), out = console.log, err = console.error, env = process.env, hook = defaultHook, wrangle = wrangleMerge } = {}) => {
     const [command, ...rest] = argv;
     if (!["tick", "status", "report", "clear"].includes(command)) {
       err(USAGE);
@@ -809,8 +757,7 @@ export const createConveyor = (config) => {
     }
     if (command === "clear") {
       const [number, head] = rest;
-      // Seven hex characters at least: a shorter prefix could match a head nobody reviewed.
-      if (rest.length !== 2 || !/^[1-9]\d*$/.test(number) || !/^[0-9a-f]{7,40}$/.test(head)) {
+      if (rest.length !== 2 || !/^[1-9]\d*$/.test(number) || !isSha(head)) {
         err(`${USAGE}\nconveyor: clear takes a PR number and the head SHA that was reviewed`);
         return 2;
       }
@@ -848,19 +795,19 @@ export const createConveyor = (config) => {
     // No lock: a dry run writes nothing, so it has nothing to contend over, even with a real tick running.
     if (dry) return tick({ cwd, run, clock, out, err, env, hook, wrangle, dir, dry });
     // One tick at a time, so a long merge and a hand-run can't land two PRs side by side.
-    const lock = join(dir, LOCK_NAME);
-    if (!takeLock(lock, clock())) {
-      out("conveyor: another tick is running");
-      return 0;
-    }
-    // Unref'd: a beat must never keep a finished tick's process alive.
-    const beat = setInterval(() => writeAtomic(lock, lockText(clock())), beatMs);
-    beat.unref();
+    let release;
     try {
+      release = takeLock(join(dir, LOCK_NAME));
+      if (!release) {
+        out("conveyor: another tick is running or the lock needs attention");
+        return 0;
+      }
       return await tick({ cwd, run, clock, out, err, env, hook, wrangle, dir });
+    } catch (error) {
+      err(`conveyor: tick could not finish: ${error.message}`);
+      return 1;
     } finally {
-      clearInterval(beat);
-      rmSync(lock, { force: true });
+      release?.();
     }
   };
 
