@@ -36,7 +36,7 @@ The default file is `.conveyor.json` at the checkout root. `--config PATH` or `c
 | `repo` | inferred from GitHub `origin` | `owner/repo`; if supplied it must match origin |
 | `base` | `main` | target branch |
 | `baseWorkflow` | `ci.yml` | GitHub Actions workflow for base push health |
-| `releaseBranch` | unset | if set, an open PR to this distinct branch freezes writes |
+| `releaseBranch` | unset | if set, an open PR from the configured base into this distinct release branch freezes worker merges and updates |
 | `mergeMethod` | `merge` | `merge`, `squash`, or `rebase` |
 | `autoUpdate` | `false` | opt in to updating stale PR branches |
 | `clearancePublisherId` | unset | positive numeric GitHub user ID; required for clear and resume |
