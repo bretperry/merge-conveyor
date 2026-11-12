@@ -11,44 +11,54 @@ const has = Object.hasOwn;
 const optional = (object, field, validate) => !has(object, field) || validate(object[field]);
 const mapOf = (validate) => (value) => isObject(value) && Object.values(value).every(validate);
 const isFlight = (value) => isObject(value) && Number.isSafeInteger(value.number) && value.number > 0 && isSha(value.head) && isDate(value.at);
+const isAction = (value) => isObject(value) && Number.isSafeInteger(value.number) && value.number > 0 &&
+  isSha(value.headSha) && isDate(value.at) &&
+  (value.kind === "merged" ? isSha(value.mergeSha) : value.kind === "updated" && isSha(value.newHeadSha));
 const isOperation = (value) =>
-  isFlight(value) && ["merge", "update"].includes(value.kind) && isText(value.base) && value.base.length > 0 && isSha(value.baseSha);
+  isFlight(value) && ["merge", "update"].includes(value.kind) && isText(value.base) && value.base.length > 0 && isSha(value.baseSha) && optional(value, "repo", (repo) => isText(repo) && repo.length > 0);
 
 const validState = (value) =>
   isObject(value) &&
   optional(value, "schemaVersion", (version) => version === 1) &&
   ["alarmed", "hooked", "attempts"].every((field) => optional(value, field, mapOf(isDate))) &&
-  ["lastTickAt", "lastMergeAt", "lastReportAt", "devBlockedSince"].every((field) => optional(value, field, isDate)) &&
+  ["lastTickAt", "lastSuccessfulTickAt", "lastMergeAt", "lastReportAt", "devBlockedSince"].every((field) => optional(value, field, isDate)) &&
   optional(value, "stopped", isText) &&
   optional(value, "voided", mapOf((entry) => isObject(entry) && Array.isArray(entry.classes) && entry.classes.every(isText) && isDate(entry.at))) &&
   optional(value, "outbox", (outbox) => Array.isArray(outbox) && outbox.every((entry) => isObject(entry) && isText(entry.key) && isText(entry.line))) &&
   optional(value, "outboxDropped", (count) => Number.isSafeInteger(count) && count >= 0) &&
   optional(value, "updating", (flight) => isFlight(flight) && isText(flight.digest) && optional(flight, "settled", (settled) => typeof settled === "boolean")) &&
   optional(value, "operation", isOperation) &&
+  optional(value, "lastAction", isAction) &&
   !(has(value, "updating") && has(value, "operation"));
 
 export const readState = (path) => {
   let saved;
+  let legacy = false;
   try {
     saved = parseJson(readFileSync(path, "utf8"));
+    legacy = isObject(saved) && !has(saved, "schemaVersion");
   } catch (error) {
     if (error.code !== "ENOENT") return { corrupt: true };
     saved = {};
   }
   if (!validState(saved)) return { corrupt: true };
-  return { state: { alarmed: {}, hooked: {}, attempts: {}, outbox: [], outboxDropped: 0, voided: {}, ...saved, schemaVersion: 1 } };
+  return { legacy, state: { alarmed: {}, hooked: {}, attempts: {}, outbox: [], outboxDropped: 0, voided: {}, ...saved, schemaVersion: 1 } };
 };
 
 export const writeState = (path, state, keepAfter) => {
   const fresh = (map) => Object.fromEntries(Object.entries(map).filter(([, at]) => Date.parse(at) >= keepAfter));
   const pruned = { ...state, alarmed: fresh(state.alarmed), hooked: fresh(state.hooked), attempts: fresh(state.attempts) };
   // The journal is flushed before the write is sent to GitHub. Readers see either whole version.
+  writePrivateJson(path, pruned);
+};
+
+export const writePrivateJson = (path, value) => {
   const temp = mkdtempSync(join(dirname(path), `.${basename(path)}-`));
   const next = join(temp, "state");
   try {
     const fd = openSync(next, "wx", 0o600);
     try {
-      writeFileSync(fd, `${JSON.stringify(pruned, null, 2)}\n`);
+      writeFileSync(fd, `${JSON.stringify(value, null, 2)}\n`);
       fsyncSync(fd);
     } finally {
       closeSync(fd);
