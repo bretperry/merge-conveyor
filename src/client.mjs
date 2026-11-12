@@ -152,14 +152,13 @@ const connect = (options, dependencies, worker) => {
   let repo;
   const run = (argv, timeout = COMMAND_MS) => {
     const remaining = Math.floor(deadline - performance.now());
+    const env = { ...process.env, GH_HOST: "github.com", GH_PROMPT_DISABLED: "1", GH_NO_UPDATE_NOTIFIER: "1",
+      ...(repo ? { GH_REPO: `github.com/${repo}` } : {}) };
+    // Git's legacy GIT_CONFIG override affects config discovery but not status.
+    if (argv[0] === "git") delete env.GIT_CONFIG;
     const result = ++calls > maxCalls || remaining <= 0
       ? { status: 1, stdout: "", code: "BUDGET" }
-      : spawn(argv, {
-        cwd: root,
-        timeout: Math.min(timeout, remaining, COMMAND_MS),
-        env: { ...process.env, GH_HOST: "github.com", GH_PROMPT_DISABLED: "1", GH_NO_UPDATE_NOTIFIER: "1",
-          ...(repo ? { GH_REPO: `github.com/${repo}` } : {}) },
-      });
+      : spawn(argv, { cwd: root, timeout: Math.min(timeout, remaining, COMMAND_MS), env });
     if (result.status === 0) return result;
     lastFailure = httpError(result, argv[0], clock());
     return { ...result, stderr: lastFailure.message };

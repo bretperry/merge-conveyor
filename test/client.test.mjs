@@ -41,7 +41,7 @@ const fixture = (t, options = {}) => {
   const auth = () => model.prs.map((pr) => ({ context: clearance(pr.number).context, state: "success", creator: { id: 100 } }));
   const run = (argv, context) => {
     model.calls.push(argv);
-    const override = model.override?.(argv);
+    const override = model.override?.(argv, context);
     if (override) return override;
     const [cmd, group, verb, arg] = argv;
     if (cmd === "git") {
@@ -49,7 +49,7 @@ const fixture = (t, options = {}) => {
       if (argv.includes("--git-common-dir")) return ok(dir);
       if (group === "remote") return ok("https://github.com/example/widgets.git");
       if (argv.includes("--abbrev-ref")) return ok("main");
-      if (argv.includes("--get-regexp") || argv.includes("--stage")) return ok("");
+      if (argv.includes("--name-only") || argv.includes("--stage")) return ok("");
       if (argv.includes("--porcelain")) return ok("");
       if (argv.at(-1) === "HEAD") return ok(BASE);
     }
@@ -255,10 +255,19 @@ test("a failing status that shares a clearance prefix still blocks CI", async (t
 
 test("preview disables executable Git filters and rejects submodule checkouts", async (t) => {
   const f = fixture(t);
+  const previousConfig = process.env.GIT_CONFIG;
+  process.env.GIT_CONFIG = "/dev/null";
+  t.after(() => {
+    if (previousConfig === undefined) delete process.env.GIT_CONFIG;
+    else process.env.GIT_CONFIG = previousConfig;
+  });
   let submodule = false;
   let statusRead = false;
-  f.model.override = (argv) => {
-    if (argv.includes("--get-regexp")) return ok("filter.fixture.process\0filter.fixture.clean\0");
+  f.model.override = (argv, context) => {
+    if (argv.includes("--name-only")) {
+      assert.equal(context.env.GIT_CONFIG, undefined);
+      return ok("filter.fixture.process\0filter.fixture.clean\0remote.origin.url\0");
+    }
     if (argv.includes("--stage")) return ok(submodule ? `160000 ${HEAD} 0\tdependency\0` : "");
     if (!argv.includes("--porcelain")) return null;
     assert.ok(argv.includes("core.fsmonitor=false"));
@@ -288,8 +297,12 @@ test("a pause cannot succeed while a tick owns consent", async (t) => {
   assert.equal(value(await f.client.tick()).kind, "unknown");
   assert.equal(value(await f.client.status()).lastSuccessfulTickAt, null);
   assert.equal((await pause).error.code, "operator_locked");
+  f.model.time += 1_000;
+  assert.equal(value(await f.client.tick()).kind, "blocked");
+  assert.equal(value(await f.client.status()).lastSuccessfulTickAt, null);
   assert.equal(value(await f.client.pause()).changed, true);
   assert.equal(value(await f.client.tick()).reason.code, "paused");
+  assert.equal(value(await f.client.status()).lastSuccessfulTickAt, null);
   assert.equal(f.model.writes.length, 1);
 });
 

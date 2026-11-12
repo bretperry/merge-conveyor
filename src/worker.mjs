@@ -242,9 +242,12 @@ export const createWorker = (config, runtime) => {
     if (branch.stdout.trim() !== BASE_BRANCH) return `this clone is on ${branch.stdout.trim() || "no branch"}, not ${BASE_BRANCH}`;
     const git = ["git", "-c", "core.fsmonitor=false", "--no-optional-locks", "-C", cwd];
     if (runtime) {
-      const filters = run([...git, "config", "--null", "--name-only", "--get-regexp", "^filter\\..*\\.(clean|process)$"]);
-      if (filters.status !== 0 && (filters.status !== 1 || filters.stderr)) return "can't read checkout filter settings";
-      const drivers = new Set(filters.stdout.split("\0").filter(Boolean).map((name) => name.replace(/\.(clean|process)$/u, "")));
+      const settings = run([...git, "config", "--null", "--name-only", "--list"]);
+      if (settings.status !== 0) return "can't read checkout filter settings";
+      const drivers = new Set(settings.stdout.split("\0").flatMap((name) => {
+        const match = /^(filter\..+)\.(?:clean|process)$/u.exec(name);
+        return match ? [match[1]] : [];
+      }));
       // A submodule can have its own filter configuration. Use a worker checkout without submodules.
       const index = run([...git, "ls-files", "--stage", "-z"]);
       if (index.status !== 0) return "can't read the worker's index";
@@ -748,6 +751,13 @@ export const createWorker = (config, runtime) => {
     const land = (pr, submit) => commandoMerge(pr, { cwd, run, now: clock(), out, err, wrangle, submit });
     const failureHook = dry ? (_command, _input, hookEnv) => (hooks.push(`#${hookEnv.CONVEYOR_PR} at ${short(hookEnv.CONVEYOR_HEAD)}`), "") : hook;
     const report = () => dryReport(seen, { out, alarms, hooks, queued: state.outbox.length });
+    const recordSuccess = (code) => {
+      const unconfirmed = (state.operation || state.updating || seen.submitted) && !seen.outcome;
+      if (runtime && code === 0 && seen.unread.length === 0 && !seen.preflight && !unconfirmed) {
+        state.lastSuccessfulTickAt = now.toISOString();
+      }
+      return code;
+    };
     // The switch isn't on: no merge, no hook. An off or unset switch is a choice, so it is told to stdout and
     // logged when it changes. One that couldn't be read goes the alarm path, so a dead conveyor is noticed.
     const stop = () => {
@@ -767,17 +777,14 @@ export const createWorker = (config, runtime) => {
         if (!enabled.on) return report();
       } else if (!enabled.on) {
         reconcile({ state, now, run, alarm, seen });
-        const code = stop();
-        if (runtime && code === 0 && seen.unread.length === 0 && !seen.preflight) state.lastSuccessfulTickAt = now.toISOString();
-        return code;
+        return recordSuccess(stop());
       } else if (state.stopped) {
         logLine(`conveyor: ${ENABLED_VARIABLE} is "${ENABLED_VALUE}" again; acting`);
         delete state.stopped;
       }
       if (!dry) flush();
       const code = await pass({ cwd, run, clock, env, hook: failureHook, dir, now, state, tell, alarm, save, land, seen, dry });
-      if (runtime && code === 0 && seen.unread.length === 0 && !seen.preflight && (!seen.submitted || seen.outcome)) state.lastSuccessfulTickAt = now.toISOString();
-      return dry ? report() : code;
+      return dry ? report() : recordSuccess(code);
     } catch (error) {
       if (dry) {
         seen.unread.push(`the pass failed: ${error.message}`);
