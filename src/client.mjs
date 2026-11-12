@@ -123,7 +123,7 @@ const readConsent = (dir, scope, now) => {
 const setConsent = (dir, config, now, on) => {
   const path = join(dir, CONSENT_FILE);
   const release = takeLock(`${path}.lock`);
-  if (!release) return failed(error("operator_locked", "Another operator is changing consent. Try again."));
+  if (!release) return failed(error("operator_locked", "A worker tick or consent change is running. Retry after it finishes."));
   try {
     const existing = readConsent(dir, config, now);
     if (existing.unreadable) return failed(error("consent_unavailable", "The consent file is unreadable or unsupported."));
@@ -182,15 +182,15 @@ const connect = (options, dependencies, worker) => {
     const user = result.status === 0 ? parseJson(result.stdout) : null;
     return positive(user?.id) ? user : null;
   };
-  const latestClearance = (runner, head) => {
+  const latestClearance = (runner, head, context) => {
     for (let page = 1; page <= 10; page += 1) {
       const result = runner(["gh", "api", `repos/{owner}/{repo}/commits/${head}/statuses?per_page=100&page=${page}`]);
       const statuses = result.status === 0 ? parseJson(result.stdout) : null;
       if (!Array.isArray(statuses) || statuses.some((status) => typeof status?.context !== "string")) {
         return { error: readError("Could not read clearance for the current head.") };
       }
-      const status = statuses.find(({ context }) => context.toLowerCase() === config.clearanceContext.toLowerCase());
-      if (status || statuses.length < 100) return { status };
+      const status = statuses.find((item) => item.context.toLowerCase() === context.toLowerCase());
+      if (status || statuses.length < 100) return { status: status?.context === context ? status : undefined };
     }
     return { error: error("data_unavailable", "The commit status history exceeded the clearance read limit.") };
   };
@@ -209,6 +209,7 @@ const connect = (options, dependencies, worker) => {
     },
   }, {
     repo, shipFreeze: !!config.releaseBranch, readSwitch, readError, viewer, latestClearance,
+    lockConsent: () => takeLock(join(dir, `${CONSENT_FILE}.lock`)),
     listOpen: (runner) => listQueue(runner, repo, config.base, readError),
     policy: options.policy && ((action, paths) => {
       try {

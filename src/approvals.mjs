@@ -41,11 +41,17 @@ const changeDigest = (files) => {
   return createHash("sha256").update(lines.toSorted((x, y) => x.localeCompare(y)).join("\n")).digest("hex");
 };
 
-const headOf = (pr, run) => {
-  const view = run(["gh", "pr", "view", String(pr), "--json", "headRefOid"]);
+const headOf = (pr, run, includeFiles = false) => {
+  const fields = includeFiles ? "headRefOid,baseRefOid,changedFiles" : "headRefOid";
+  const view = run(["gh", "pr", "view", String(pr), "--json", fields]);
   if (view.status !== 0) return { error: `can't read #${pr}: ${view.stderr.trim()}` };
   try {
-    const { headRefOid: head } = JSON.parse(view.stdout);
+    const { headRefOid: head, baseRefOid: base, changedFiles } = JSON.parse(view.stdout);
+    if (includeFiles) {
+      return isSha(head) && isSha(base) && Number.isSafeInteger(changedFiles) && changedFiles > 0
+        ? { head, base, changedFiles }
+        : { error: `can't verify #${pr}'s head, base and changed-file count` };
+    }
     return head ? { head } : { error: `can't read #${pr}'s head commit` };
   } catch {
     return { error: `can't parse #${pr}` };
@@ -81,7 +87,7 @@ const boundedFiles = (pr, run, limit) => {
       if (typeof row?.filename !== "string" || !row.filename || !isSha(row.sha) ||
         !["added", "removed", "modified", "renamed", "copied", "changed", "unchanged"].includes(row.status) ||
         (row.status === "renamed" && (typeof row.previous_filename !== "string" || !row.previous_filename))) return null;
-      files.push({ path: row.filename, status: row.status, sha: row.sha, previous: row.previous_filename, ref: listedAt(row.contents_url) });
+      files.push({ path: row.filename, status: row.status, sha: row.sha, previous: row.previous_filename ?? "", ref: listedAt(row.contents_url) });
     }
     if (rows.length < 100) break;
   }
@@ -140,16 +146,20 @@ export const createApprovals = ({ HOLD_PATTERNS, MAX_PR_FILES, heldBy, pathsHeld
   // listed commit must be it, so a push between the two reads can't pair one head with another's files.
   // `allModes` reads each file's mode even with nothing held: a review gate's digest covers files the hold list doesn't.
   const readHeld = (pr, run, { allModes = false } = {}) => {
-    const before = headOf(pr, run);
+    const before = headOf(pr, run, boundedReads);
     if (before.error) return before;
+    if (boundedReads && before.changedFiles >= MAX_PR_FILES) return { error: `#${pr} is at or above the changed-file limit of ${MAX_PR_FILES}` };
     const files = boundedReads ? boundedFiles(pr, run, MAX_PR_FILES) : prFiles(pr, run);
     if (files === null) return { error: `can't read #${pr}'s changed files` };
     // A PR changes at least one file; an empty list under a good status is a read that lost its entries, and no held path was ruled out by it.
     if (files.length === 0) return { error: `#${pr}'s changed files came back empty, so no held path was ruled out` };
     if (files.length >= MAX_PR_FILES) return { error: `#${pr} is at GitHub's limit of ${MAX_PR_FILES} listed files, so a held path could be past it` };
-    const after = headOf(pr, run);
+    const after = headOf(pr, run, boundedReads);
     if (after.error) return after;
     if (after.head !== before.head) return { error: `#${pr} moved while it was being read` };
+    if (boundedReads && (after.base !== before.base || after.changedFiles !== before.changedFiles || files.length !== before.changedFiles)) {
+      return { error: `can't verify the complete changed-file list for #${pr}` };
+    }
     // Each entry's contents_url carries the commit it was listed at, so a list that straddles a push (head A, a
     // push of B, the files read, then A back) isn't this head's list. A removed file's URL names the base commit
     // (the file isn't at the head), so a removed entry is not checked.

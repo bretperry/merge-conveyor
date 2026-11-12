@@ -132,14 +132,22 @@ export const createWorker = (config, runtime) => {
 
 
   // The real status only: a check run anyone's workflow can name the same, and it isn't a review's mark.
-  const isClearedStatus = ({ __typename: type, context }) => type === "StatusContext" && typeof context === "string" && context.toLowerCase() === CLEARED_CONTEXT.toLowerCase();
+  const clearanceContext = (number) => runtime ? `${CLEARED_CONTEXT}/pr-${number}/${BASE_BRANCH}` : CLEARED_CONTEXT;
+  const isClearanceContext = ({ __typename: type, context }) => {
+    if (type !== "StatusContext" || typeof context !== "string") return false;
+    const name = context.toLowerCase();
+    const prefix = CLEARED_CONTEXT.toLowerCase();
+    return name === prefix || (runtime && name.startsWith(`${prefix}/pr-`));
+  };
+  const isClearedStatus = (row, number) => isClearanceContext(row) &&
+    (runtime ? row.context === clearanceContext(number) : true);
 
   // Queue candidates need a full head, an actual clearance status, and nonempty green CI.
   const classify = (pr) => {
     const rows = checkRows(pr.statusCheckRollup);
-    const clearedRow = rows?.find(isClearedStatus);
+    const clearedRow = rows?.find((row) => isClearedStatus(row, pr.number));
     const clearedAt = clearedRow?.state === "SUCCESS" && Number.isFinite(Date.parse(clearedRow.startedAt)) ? clearedRow.startedAt : null;
-    const checks = rows?.filter((row) => !isClearedStatus(row) && !(row.__typename === "StatusContext" && isGateContext(row.context)));
+    const checks = rows?.filter((row) => !isClearanceContext(row) && !(row.__typename === "StatusContext" && isGateContext(row.context)));
     const verdict = rows ? ciVerdict(checks) : "unknown";
     const base = { number: pr.number, title: pr.title ?? "", head: pr.headRefOid ?? "", clearedAt, fork: pr.isCrossRepository !== false, checksDone: checks?.length > 0 && checks.every((row) => ["green", "red"].includes(ciVerdict([row]))) };
     if ((!pr.isDraft || clearedAt) && verdict === "red") return { ...base, kind: "failure", failure: "failing", detail: checks.filter((row) => ciVerdict([row]) === "red").map((row) => row.name).join(", ") };
@@ -153,17 +161,17 @@ export const createWorker = (config, runtime) => {
 
   // Existing adapters may establish trust in their configured context. Standalone deployments can
   // additionally pin the publisher. Only the latest status for the context can authorize a write.
-  const clearanceProblem = (head, run) => {
+  const clearanceProblem = (head, number, run) => {
     if (!CLEARANCE_PUBLISHER) return runtime ? "no trusted clearance publisher configured" : "";
     if (runtime) {
-      const latest = runtime.latestClearance(run, head);
+      const latest = runtime.latestClearance(run, head, clearanceContext(number));
       if (latest.error) return "can't read clearance publisher";
       return latest.status?.state === "success" && latest.status.creator?.id === CLEARANCE_PUBLISHER ? "" : "no clearance from the trusted publisher on this head";
     }
     const result = run(["gh", "api", `repos/{owner}/{repo}/commits/${head}/statuses?per_page=100`]);
     const statuses = result.status === 0 ? parseJson(result.stdout) : null;
     if (!Array.isArray(statuses) || statuses.some((status) => typeof status?.context !== "string")) return "can't read clearance publisher";
-    const latest = statuses.find((status) => status.context.toLowerCase() === CLEARED_CONTEXT.toLowerCase());
+    const latest = statuses.find((status) => status.context.toLowerCase() === clearanceContext(number).toLowerCase());
     return latest?.state === "success" && latest.creator?.id === CLEARANCE_PUBLISHER ? "" : "no clearance from the trusted publisher on this head";
   };
 
@@ -230,7 +238,7 @@ export const createWorker = (config, runtime) => {
     const branch = run(["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"]);
     if (branch.status !== 0) return "can't read the worker's branch";
     if (branch.stdout.trim() !== BASE_BRANCH) return `this clone is on ${branch.stdout.trim() || "no branch"}, not ${BASE_BRANCH}`;
-    const status = run(["git", "--no-optional-locks", "-C", cwd, "status", "--porcelain"]);
+    const status = run(["git", "-c", "core.fsmonitor=false", "--no-optional-locks", "-C", cwd, "status", "--porcelain"]);
     if (status.status !== 0) return "can't read the worker's checkout status";
     if (status.stdout.trim()) return "this clone has uncommitted changes";
     const tip = devTip(run);
@@ -264,7 +272,7 @@ export const createWorker = (config, runtime) => {
     const notes = approvalClock(cwd, now);
     const inWindow = merged.filter((pr) => Date.parse(pr.mergedAt) >= since.getTime());
     const spans = inWindow.map((pr) => {
-      const start = notes.get(pr.number) ?? pr.statusCheckRollup?.find(isClearedStatus)?.startedAt;
+      const start = notes.get(pr.number) ?? checkRows(pr.statusCheckRollup)?.find((row) => isClearedStatus(row, pr.number))?.startedAt;
       return (Date.parse(pr.mergedAt) - Date.parse(start)) / MINUTE;
     });
     // NaN is no clock; below zero is a note written after the merge, which measures nothing.
@@ -362,7 +370,8 @@ export const createWorker = (config, runtime) => {
       if (!pr || pr.headRefOid !== result.headRefOid || pr.baseRefName !== result.baseRefName) return waiting(`can't read #${operation.number}'s updated head`, true);
       if (runtime && operation.baseSha && pr.baseRefName === operation.base && pr.headRefOid !== operation.head) {
         const compared = staleness(pr.headRefOid, run, operation.baseSha);
-        if (!compared.error && !compared.stale) {
+        if (compared.error) return waiting(`can't verify #${operation.number}'s updated head against the recorded base`, true);
+        if (!compared.stale) {
           const action = { kind: "updated", number: operation.number, headSha: operation.head, newHeadSha: pr.headRefOid, at: now.toISOString() };
           if (state.lastAction?.newHeadSha !== action.newHeadSha || state.lastAction?.number !== action.number) state.lastAction = action;
           if (seen.submitted === operation) seen.outcome = action;
@@ -385,7 +394,7 @@ export const createWorker = (config, runtime) => {
     if (!hasStrictChecks(run, BASE_BRANCH)) return `can't verify strict required checks on ${BASE_BRANCH}`;
     const held = heldState(pr, run);
     if (held.error) return held.error;
-    const clearance = clearanceProblem(pr.head, run);
+    const clearance = clearanceProblem(pr.head, pr.number, run);
     if (clearance) return clearance;
     if (!preview && runtime?.policy && !runtime.policy({ kind, number: pr.number, headSha: pr.head }, held.paths)) return "the repository policy refused this action";
     const switchNow = readSwitch(run, dir, clock());
@@ -412,7 +421,23 @@ export const createWorker = (config, runtime) => {
       const held = mergeRetryAt ? undefined : heldState(pr, run);
       const classes = held && !held.error ? openHolds(dir, pr.number, now, held) : undefined;
       const moved = held && !held.error && !classes.length ? staleness(pr.head, run, dev.sha) : undefined;
-      yield { pr, held, moved, decision: candidateDecision(candidate, { held, classes, moved }, AUTO_UPDATE) };
+      let decision = candidateDecision(candidate, { held, classes, moved }, AUTO_UPDATE);
+      if (runtime && ["merge", "update"].includes(decision.kind)) {
+        const clearance = clearanceProblem(pr.head, pr.number, run);
+        if (clearance) {
+          const issue = preflightIssue(clearance);
+          decision = { kind: issue.unknown ? "unknown" : "blocked", ...issue.reason };
+        } else if (decision.kind === "merge") {
+          const live = readPull(run, pr.number, ["baseRefOid", "mergeStateStatus"]);
+          if (!live || live.headRefOid !== pr.head || live.state !== "OPEN" || live.baseRefName !== BASE_BRANCH || live.baseRefOid !== dev.sha ||
+            !live.mergeStateStatus || live.mergeStateStatus === "UNKNOWN") {
+            decision = { kind: "unknown", code: "pr_evidence_unavailable", message: "Could not verify the pull request's merge state." };
+          } else if (live.mergeStateStatus !== "CLEAN") {
+            decision = { kind: "blocked", code: "github_not_ready", message: "GitHub does not report the head ready for this action." };
+          }
+        }
+      }
+      yield { pr, held, moved, decision };
     }
   }
 
@@ -453,6 +478,10 @@ export const createWorker = (config, runtime) => {
         seen.why.push(`#${pr.number} is stale: ${moved.why}`);
         if (pr.fork) alarm(`fork:${pr.number}@${pr.head}`, `#${pr.number} is stale and comes from a fork; a session needs to update it. (${pr.title})`);
       }
+      if (decision.kind === "unknown") {
+        seen.unread.push(decision.message);
+        break;
+      }
       if (decision.kind === "merge") break;
     }
     const { selected } = chooseAction(observations);
@@ -473,8 +502,17 @@ export const createWorker = (config, runtime) => {
       state.operation = { kind, number: pr.number, head: pr.head, base: BASE_BRANCH, baseSha: dev.sha, at: at.toISOString(),
         ...(runtime ? { repo: runtime.repo } : {}) };
       const attempt = `${pr.number}@${pr.head}`;
-      state.attempts[kind === "update" ? `update:${attempt}` : attempt] = state.operation.at;
+      const key = kind === "update" ? `update:${attempt}` : attempt;
+      const previousAttempt = state.attempts[key];
+      state.attempts[key] = state.operation.at;
       save(at);
+      if (runtime && !readSwitch(run, dir, clock()).on) {
+        delete state.operation;
+        if (previousAttempt === undefined) delete state.attempts[key];
+        else state.attempts[key] = previousAttempt;
+        seen.preflight = "commando is off";
+        return seen.preflight;
+      }
       seen.submitted = state.operation;
       return "";
     };
@@ -654,7 +692,7 @@ export const createWorker = (config, runtime) => {
         } catch {
           problem = "notification callback failed";
         }
-      } else problem = env.CONVEYOR_ALARM_COMMAND ? hook(env.CONVEYOR_ALARM_COMMAND, `${line}\n`, env) : "";
+      } else problem = env.CONVEYOR_ALARM_COMMAND ? hook(env.CONVEYOR_ALARM_COMMAND, `${line}\n`, env) : runtime ? "notification callback is not configured" : "";
       if (!problem) return true;
       down = true;
       err(runtime ? `conveyor: notification failed: ${problem}` : `conveyor: CONVEYOR_ALARM_COMMAND failed: ${problem}`);
@@ -711,7 +749,7 @@ export const createWorker = (config, runtime) => {
       } else if (!enabled.on) {
         reconcile({ state, now, run, alarm, seen });
         const code = stop();
-        if (runtime && code === 0 && seen.unread.length === 0) state.lastSuccessfulTickAt = now.toISOString();
+        if (runtime && code === 0 && seen.unread.length === 0 && !seen.preflight) state.lastSuccessfulTickAt = now.toISOString();
         return code;
       } else if (state.stopped) {
         logLine(`conveyor: ${ENABLED_VARIABLE} is "${ENABLED_VALUE}" again; acting`);
@@ -719,7 +757,7 @@ export const createWorker = (config, runtime) => {
       }
       if (!dry) flush();
       const code = await pass({ cwd, run, clock, env, hook: failureHook, dir, now, state, tell, alarm, save, land, seen, dry });
-      if (runtime && code === 0 && seen.unread.length === 0) state.lastSuccessfulTickAt = now.toISOString();
+      if (runtime && code === 0 && seen.unread.length === 0 && !seen.preflight) state.lastSuccessfulTickAt = now.toISOString();
       return dry ? report() : code;
     } catch (error) {
       if (dry) {
@@ -767,8 +805,8 @@ export const createWorker = (config, runtime) => {
   };
 
   // Posts the status on one head. Returns "" or what went wrong.
-  const postCleared = (run, head, description) => {
-    const post = run(["gh", "api", "--method", "POST", `repos/{owner}/{repo}/statuses/${head}`, "-f", "state=success", "-f", `context=${CLEARED_CONTEXT}`, "-f", `description=${description}`]);
+  const postCleared = (run, number, head, description) => {
+    const post = run(["gh", "api", "--method", "POST", `repos/{owner}/{repo}/statuses/${head}`, "-f", "state=success", "-f", `context=${clearanceContext(number)}`, "-f", `description=${description}`]);
     return post.status === 0 ? "" : post.stderr.trim() || `exit ${post.status}`;
   };
 
@@ -789,7 +827,7 @@ export const createWorker = (config, runtime) => {
       err(`conveyor: #${number}'s head is ${short(pr.headRefOid)}, not ${head}; review the new head, then clear it.`);
       return 1;
     }
-    const problem = postCleared(run, pr.headRefOid, "Reviews passed at this head");
+    const problem = postCleared(run, number, pr.headRefOid, "Reviews passed at this head");
     if (problem) {
       err(`conveyor: can't post the status on #${number}: ${problem}`);
       return 1;
@@ -822,13 +860,13 @@ export const createWorker = (config, runtime) => {
     if (pr.mergeable === "CONFLICTING") return true;
     if (pr.mergeable !== "MERGEABLE") return false;
     const rows = checkRows(pr.statusCheckRollup);
-    if (!rows || rows.some((row) => isClearedStatus(row) && row.state === "SUCCESS" && !Number.isFinite(Date.parse(row.startedAt)))) return false;
-    return ciVerdict(rows.filter((row) => !isClearedStatus(row))) !== "unknown";
+    if (!rows || rows.some((row) => isClearedStatus(row, pr.number) && row.state === "SUCCESS" && !Number.isFinite(Date.parse(row.startedAt)))) return false;
+    return ciVerdict(rows.filter((row) => !isClearanceContext(row))) !== "unknown";
   };
 
   const detailsOf = (raw, pr, decision) => {
     const rows = checkRows(raw.statusCheckRollup);
-    const checks = (rows ?? []).filter((row) => !isClearedStatus(row) &&
+    const checks = (rows ?? []).filter((row) => !isClearanceContext(row) &&
       !(row.__typename === "StatusContext" && isGateContext(row.context))).map((row) => {
       const url = row.detailsUrl ?? row.targetUrl;
       return { name: row.name, state: ciVerdict([row]), ...(typeof url === "string" && /^https:\/\//i.test(url) ? { url } : {}) };
@@ -909,30 +947,44 @@ export const createWorker = (config, runtime) => {
     const baseTip = dev?.green ? dev : candidates ? devTip(run) : undefined;
     const stale = candidates && sw.on ? cloneProblem(cwd, run) : "";
     const ship = candidates && sw.on ? shipState(run) : undefined;
-    const observations = baseTip?.sha ? [...candidateObservations(prs, state, now, seen.reconciledOpen, { dev: baseTip, dir, run })] : [];
+    const globalBlockers = viewBlockers({ sw, dev, stale, ship, pending, state, now });
+    if (listed.incompleteReason) globalBlockers.unshift(listed.incompleteReason);
+    const listKnown = listed.complete && listed.prs.every(knownInputs);
+    const inputKnown = listKnown && !sw.unreadable && !dev?.unreadable && !baseTip?.error &&
+      !stale?.startsWith("can't read") && !ship?.error && seen.unread.length === 0;
+    const observations = [];
+    let verification;
+    let earlierUnknown = false;
+    const verify = ({ pr, decision: { kind } }) => {
+      const denied = preflight(pr, kind, dev.sha, { cwd, dir, run, clock, preview: true });
+      return denied ? { issue: preflightIssue(denied) } : { action: { kind, number: pr.number, headSha: pr.head } };
+    };
+    if (baseTip?.sha) {
+      for (const observation of candidateObservations(prs, state, now, seen.reconciledOpen, { dev: baseTip, dir, run })) {
+        observations.push(observation);
+        if (observation.decision.kind === "unknown") earlierUnknown = true;
+        // Verify the winning merge before spending the remaining budget on later rows.
+        if (!verification && !earlierUnknown && inputKnown && globalBlockers.length === 0 && observation.decision.kind === "merge") {
+          verification = verify(observation);
+        }
+      }
+    }
     const observed = new Map(observations.map(({ pr, decision }) => [pr.number, decision]));
     const details = new Map(prs.map((pr, i) => [pr.number, detailsOf(listed.prs[i], pr, observed.get(pr.number))]));
     const ranked = ["merge", "update"].flatMap((kind) => observations.filter((item) => item.decision.kind === kind));
     ranked.forEach(({ pr }, index) => { details.get(pr.number).entry.position = index + 1; });
     const entries = [...ranked.map(({ pr }) => details.get(pr.number).entry),
       ...[...details.values()].map(({ entry }) => entry).filter((entry) => entry.position === null).toSorted((a, b) => a.number - b.number)];
-    const globalBlockers = viewBlockers({ sw, dev, stale, ship, pending, state, now });
-    if (listed.incompleteReason) globalBlockers.unshift(listed.incompleteReason);
-    const listKnown = listed.complete && listed.prs.every(knownInputs);
     const selected = chooseAction(observations);
-    const inputKnown = listKnown && !sw.unreadable && !dev?.unreadable && !baseTip?.error &&
-      !stale?.startsWith("can't read") && !ship?.error && seen.unread.length === 0;
     let complete = inputKnown && entries.every((entry) => entry.state !== "unknown");
     let nextActionKnown = (!sw.on && !sw.unreadable) || (inputKnown && (globalBlockers.length > 0 || selected.known));
     let nextAction = null;
     if (nextActionKnown && globalBlockers.length === 0 && selected.selected) {
-      const { pr, decision: { kind } } = selected.selected;
-      const denied = preflight(pr, kind, dev.sha, { cwd, dir, run, clock, preview: true });
-      if (denied) {
-        const issue = preflightIssue(denied);
+      const { issue, action } = verification ?? verify(selected.selected);
+      if (issue) {
         globalBlockers.push(issue.reason);
         if (issue.unknown) complete = nextActionKnown = false;
-      } else nextAction = { kind, number: pr.number, headSha: pr.head };
+      } else nextAction = action;
     }
     if (!complete && !listed.incompleteReason) globalBlockers.push(reason("queue_incomplete", "Some queue evidence is unavailable."));
     return { value: { schemaVersion: 1, repo: runtime.repo, base: BASE_BRANCH, observedAt: now.toISOString(), complete, globalBlockers,
@@ -1013,22 +1065,32 @@ export const createWorker = (config, runtime) => {
     };
     const problem = verifyTarget();
     if (problem) return { error: problem };
-    const existing = runtime.latestClearance(run, headSha);
+    const context = clearanceContext(number);
+    const existing = runtime.latestClearance(run, headSha, context);
     if (existing.error) return { error: existing.error };
     if (existing.status?.state === "success" && existing.status.creator?.id === CLEARANCE_PUBLISHER) {
       return { value: { kind: "already_cleared", number, headSha } };
     }
     const moved = verifyTarget();
     if (moved) return { error: moved };
-    if (postCleared(run, headSha, "Reviews passed at this head")) return { error: runtime.readError("Could not record clearance for this head.") };
-    return { value: { kind: "cleared", number, headSha } };
+    postCleared(run, number, headSha, "Reviews passed at this head");
+    const reconciled = runtime.latestClearance(run, headSha, context);
+    if (!reconciled.error && reconciled.status?.state === "success" && reconciled.status.creator?.id === CLEARANCE_PUBLISHER) {
+      return { value: { kind: "cleared", number, headSha } };
+    }
+    return { value: { kind: "unknown", number, headSha,
+      reason: reason("write_unconfirmed", "GitHub has not confirmed the clearance write. Check this head's clearance before retrying.") } };
   };
 
   const executeTick = async (ctx) => {
     const release = takeLock(join(ctx.dir, LOCK_NAME));
     if (!release) return { value: { kind: "blocked", reason: reason("worker_locked", "Another tick is running or the lock needs attention.") } };
+    let releaseConsent;
     let seen;
     try {
+      // Even workers with different journal names share this consent file.
+      releaseConsent = runtime.lockConsent();
+      if (!releaseConsent) return { value: { kind: "blocked", reason: reason("operator_locked", "A worker tick or consent change is running. Retry after it finishes.") } };
       const code = await tick({ ...ctx, observe: (value) => { seen = value; } });
       if (seen?.corrupt) return { error: reason("state_corrupt", "The worker journal is unreadable or unsupported.") };
       if (seen?.outcome) return { value: seen.outcome };
@@ -1054,6 +1116,7 @@ export const createWorker = (config, runtime) => {
       }
       throw error;
     } finally {
+      releaseConsent?.();
       release();
     }
   };

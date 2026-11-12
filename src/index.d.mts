@@ -92,11 +92,9 @@ export interface MergeReport {
   complete: boolean;
 }
 
-export interface Clearance {
-  kind: "cleared" | "already_cleared";
-  number: number;
-  headSha: string;
-}
+export type Clearance =
+  | { kind: "cleared" | "already_cleared"; number: number; headSha: string }
+  | { kind: "unknown"; number: number; headSha: string; reason: Reason };
 
 export interface Consent {
   kind: "resumed" | "paused";

@@ -51,7 +51,7 @@ export const formatQueue = (snapshot, columns = 80) => {
   const { entries, base, nextAction, nextActionKnown, globalBlockers } = snapshot;
   const width = Math.max(24, columns);
   const count = entries.length;
-  const lines = [`${visible(snapshot.repo)} → ${visible(base)} · ${count} open PR${count === 1 ? "" : "s"}`];
+  const lines = [`${visible(snapshot.repo)} → ${snapshot.complete ? count : `${count} observed`} open PR${count === 1 && snapshot.complete ? "" : "s"}`];
   const paused = globalBlockers.some(({ code }) => code === "paused");
   if (paused) lines.push("Conveyor is paused. Next action: none.");
   if (!snapshot.complete) {
@@ -121,7 +121,8 @@ const format = (command, value, columns) => {
       if (value.kind === "merged" || value.kind === "updated") return [`#${value.number} ${value.kind}.`];
       return [visible(value.reason.message)];
     }
-    case "clear": return [`#${value.number} ${value.kind === "cleared" ? "cleared" : "already cleared"} at ${value.headSha}.`];
+    case "clear": return value.kind === "unknown" ? [visible(value.reason.message)] :
+      [`#${value.number} ${value.kind === "cleared" ? "cleared" : "already cleared"} at ${value.headSha}.`];
     case "pause": return ["Conveyor is paused."];
     case "resume": return [`Conveyor consent expires at ${value.consentUntil}.`];
     default: throw new Error("Unsupported CLI operation");
@@ -196,6 +197,7 @@ export const runCli = async (argv, {
   }
   if (!result.ok) return result.error.code === "invalid_input" ? EXIT_CODES.usage : EXIT_CODES.error;
   if (action === "tick" && result.value.kind === "unknown") return EXIT_CODES.unknownWrite;
+  if (action === "clear" && result.value.kind === "unknown") return EXIT_CODES.unknownWrite;
   if ((action === "doctor" && !result.value.healthy) || (action === "status" && result.value.stateHealth === "corrupt")) return EXIT_CODES.error;
   return EXIT_CODES.ok;
 };

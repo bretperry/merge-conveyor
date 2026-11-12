@@ -14,11 +14,11 @@ const MERGE = "d".repeat(40);
 const START = "2026-01-01T12:00:00.000Z";
 const CONTEXT = "conveyor/cleared";
 const check = { __typename: "CheckRun", name: "Build", status: "COMPLETED", conclusion: "SUCCESS", detailsUrl: "https://example.test/check" };
-const clearance = { __typename: "StatusContext", context: CONTEXT, state: "SUCCESS", createdAt: START };
+const clearance = (number) => ({ __typename: "StatusContext", context: `${CONTEXT}/pr-${number}/main`, state: "SUCCESS", createdAt: START });
 const ok = (value) => ({ status: 0, stdout: typeof value === "string" ? value : JSON.stringify(value), stderr: "" });
 const pull = (number = 1, headRefOid = HEAD) => ({
-  number, title: `Pull request ${number}`, state: "OPEN", baseRefName: "main", baseRefOid: BASE, headRefOid,
-  isDraft: false, isCrossRepository: false, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", statusCheckRollup: [check, clearance],
+  number, title: `Pull request ${number}`, state: "OPEN", baseRefName: "main", baseRefOid: BASE, headRefOid, changedFiles: 1,
+  isDraft: false, isCrossRepository: false, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", statusCheckRollup: [check, clearance(number)],
 });
 const page = (prs, { total = prs.length, cursor = null } = {}) => ok({ data: { repository: { pullRequests: {
   nodes: prs.map((pr) => ({ ...pr, statusCheckRollup: pr.statusCheckRollup === null ? null : {
@@ -34,7 +34,7 @@ const fixture = (t, options = {}) => {
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
   const model = { prs: [pull()], calls: [], writes: [], time: Date.parse(START), viewer: 100, cleared: true, stale: new Set(), paths: new Map() };
   const find = (number) => model.prs.find((pr) => pr.number === Number(number));
-  const auth = () => [{ context: CONTEXT, state: "success", creator: { id: 100 } }];
+  const auth = () => model.prs.map((pr) => ({ context: `${CONTEXT}/pr-${pr.number}/main`, state: "success", creator: { id: 100 } }));
   const run = (argv, context) => {
     model.calls.push(argv);
     const override = model.override?.(argv);
@@ -188,6 +188,110 @@ test("clearance is pinned and idempotent, consent expires, and a veto runs only 
   assert.equal(value(await f.client.pause()).changed, false);
 });
 
+test("clearance belongs to the reviewed PR and base, and a lost response is reconciled", async (t) => {
+  const f = fixture(t);
+  f.model.prs[0] = { ...pull(2, HEAD), statusCheckRollup: [check, clearance(1), { ...clearance(2), context: `${CONTEXT}/pr-2/other` }] };
+  let statuses = [
+    { context: clearance(1).context, state: "success", creator: { id: 100 } },
+    { context: `${CONTEXT}/pr-2/other`, state: "success", creator: { id: 100 } },
+  ];
+  f.model.override = (argv) => argv[2]?.includes("/statuses?") ? ok(statuses) : null;
+  value(await f.client.resume());
+  assert.equal(value(await f.client.preview()).nextAction, null);
+  const target = { number: 2, headSha: HEAD };
+  f.model.onWrite = () => ok({});
+  assert.equal(value(await f.client.clear(target)).kind, "unknown");
+  f.model.onWrite = (argv) => {
+    assert.ok(argv.includes(`context=${clearance(2).context}`));
+    statuses = [{ context: clearance(2).context, state: "success", creator: { id: 100 } }, ...statuses];
+    return { status: 1, stderr: "timeout" };
+  };
+  assert.equal(value(await f.client.clear(target)).kind, "cleared");
+  assert.equal(value(await f.client.clear(target)).kind, "already_cleared");
+  assert.equal(f.model.writes.length, 2);
+});
+
+test("a short changed-file list cannot rule out a hold", async (t) => {
+  const f = fixture(t);
+  f.model.prs[0].changedFiles = 2;
+  value(await f.client.resume());
+  const preview = value(await f.client.preview());
+  assert.equal(preview.nextActionKnown, false);
+  assert.equal(preview.entries[0].reasons[0].code, "holds_unavailable");
+  assert.equal((await f.client.tick()).error.code, "data_unavailable");
+  assert.equal(f.model.writes.length, 0);
+});
+
+test("a pause cannot succeed while a tick owns consent", async (t) => {
+  const f = fixture(t);
+  value(await f.client.resume());
+  let pause;
+  f.model.onWrite = () => {
+    pause = f.client.pause();
+    return { status: 1, stderr: "timeout" };
+  };
+  assert.equal(value(await f.client.tick()).kind, "unknown");
+  assert.equal((await pause).error.code, "operator_locked");
+  assert.equal(value(await f.client.pause()).changed, true);
+  assert.equal(value(await f.client.tick()).reason.code, "paused");
+  assert.equal(f.model.writes.length, 1);
+});
+
+test("preview and tick skip definite candidate blockers", async (t) => {
+  const f = fixture(t);
+  f.model.prs.push({ ...pull(2, HEAD2), mergeStateStatus: "BLOCKED" }, pull(3, "e".repeat(40)));
+  f.model.override = (argv) => argv[2]?.includes(`/${HEAD}/statuses?`) ?
+    ok([{ context: clearance(1).context, state: "success", creator: { id: 99 } }]) : null;
+  value(await f.client.resume());
+  const preview = value(await f.client.preview());
+  assert.equal(preview.nextAction.number, 3);
+  assert.equal(preview.entries.find(({ number }) => number === 1).reasons[0].code, "trusted_clearance_required");
+  assert.equal(preview.entries.find(({ number }) => number === 2).reasons[0].code, "github_not_ready");
+  assert.deepEqual(value(await f.client.tick()).action, preview.nextAction);
+  assert.equal(f.model.writes.length, 1);
+});
+
+test("a partial lower queue cannot erase a verified next merge", async (t) => {
+  const f = fixture(t);
+  const prs = Array.from({ length: 65 }, (_, index) => pull(index + 1));
+  f.model.prs = prs;
+  f.model.override = (argv) => {
+    if (argv[2] !== "graphql") return null;
+    const start = Number(argv.find((arg) => arg.startsWith("cursor="))?.split("=")[1] ?? 0);
+    const end = start + 25;
+    return page(prs.slice(start, end), { total: prs.length, cursor: end < prs.length ? String(end) : null });
+  };
+  value(await f.client.resume());
+  const preview = value(await f.client.preview());
+  assert.equal(preview.complete, false);
+  assert.equal(preview.nextActionKnown, true);
+  assert.equal(preview.nextAction.number, 1);
+  assert.deepEqual(value(await f.client.tick()).action, preview.nextAction);
+});
+
+test("a failed update comparison retains the journal and an undelivered legacy alarm", async (t) => {
+  const f = fixture(t, { config: { autoUpdate: true } });
+  const queued = { key: "legacy", line: "A pending alarm" };
+  writeFileSync(f.statePath, JSON.stringify({ outbox: [queued] }));
+  f.model.stale.add(HEAD);
+  value(await f.client.resume());
+  f.model.onWrite = () => {
+    f.model.prs[0] = { ...pull(1, HEAD2), statusCheckRollup: [check] };
+    f.model.override = (argv) => argv[2]?.includes(`/compare/${HEAD2}...`) ? { status: 1, stderr: "HTTP 502" } : null;
+    return { status: 1, stderr: "timeout" };
+  };
+  assert.equal(value(await f.client.tick()).kind, "unknown");
+  const saved = JSON.parse(readFileSync(f.statePath, "utf8"));
+  assert.equal(saved.operation.head, HEAD);
+  assert.deepEqual(saved.outbox[0], queued);
+  assert.equal(saved.lastSuccessfulTickAt, undefined);
+  await f.client.tick();
+  assert.equal(f.model.writes.length, 1);
+  f.model.override = null;
+  await f.client.tick();
+  assert.equal(value(await f.client.status()).lastAction.newHeadSha, HEAD2);
+});
+
 test("CLI JSON is one result with stable exit codes and sanitized read errors", async (t) => {
   const f = fixture(t);
   const cli = async (argv, client = f.client) => {
@@ -208,6 +312,11 @@ test("CLI JSON is one result with stable exit codes and sanitized read errors", 
   assert.equal((await cli(["tick", "--dryrun"])).code, 2);
   const unknown = await cli(["tick", "--json"], { tick: async () => ({ ok: true, value: { kind: "unknown" } }) });
   assert.equal(unknown.code, 3);
+  const unknownClear = await cli(["clear", "1", HEAD], { clear: async () => ({
+    ok: true, value: { kind: "unknown", reason: { message: "Clearance unconfirmed." } },
+  }) });
+  assert.equal(unknownClear.code, 3);
+  assert.equal(unknownClear.stdout.trim(), "Clearance unconfirmed.");
   f.model.override = (argv) => argv[2] === "graphql" && { status: 1, stderr: "HTTP 401: private diagnostic" };
   const offline = await cli(["queue", "--json"]);
   assert.equal(offline.code, 1);
