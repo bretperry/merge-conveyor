@@ -17,7 +17,7 @@ Conveyor should give maintainers and agents a reliable way to see what is waitin
 | Phase | What | After | Model | State |
 |---|---|---|---|---|
 | 0 | Settle scope and public contract | — | deep (xhigh) | landed; owner approved 2026-11-11 |
-| 1 | Harden merge, state, and recovery | 0 | deep (xhigh) | running; held by codex/conveyor-phase-1 |
+| 1 | Harden merge, state, and recovery | 0 | deep (xhigh) | blocked (#1); GitHub-generated author identity fails the package gate; owner decision pending |
 | 2 | Ship the CLI, queue, and typed API | 1 | workhorse (high) | |
 | 3 | Write public docs and clean up comments | 2 | workhorse (medium) | |
 | 4a | Rehearse install, upgrade, and release | 3 | deep (high) | |
@@ -184,6 +184,11 @@ Write README, minimal config, API reference, agent walkthrough, operator recover
 Pack and install in a clean directory, validate the tarball and commit history, and rehearse release and rollback. Test a disposable protected repo with required CI, plus compatibility with the existing integration.
 
 **Done when:** A human and an agent each complete queue inspection through merge using the README → verify: rehearsal transcripts, package contents, CI run, and preview approval.
+
+### Human checks
+
+- [ ] `conveyor-4a-worker-permissions` — decision · 10 min · none — in a disposable repo demonstrate that strict checks apply to the actual worker identity and a PR retargeted outside configured base cannot be merged by that identity
+- [ ] `conveyor-4a-rollback-journal` — decision · 10 min · none — stop both worker versions, reconcile any pending write against GitHub, then restore the prior pin and confirm no duplicate write
 
 ## Phase 4b — Polish CLI and docs
 
