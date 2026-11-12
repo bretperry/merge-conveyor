@@ -17,7 +17,7 @@ Conveyor should give maintainers and agents a reliable way to see what is waitin
 | Phase | What | After | Model | State |
 |---|---|---|---|---|
 | 0 | Settle scope and public contract | — | deep (xhigh) | landed; owner approved 2026-11-11 |
-| 1 | Harden merge, state, and recovery | 0 | deep (xhigh) | |
+| 1 | Harden merge, state, and recovery | 0 | deep (xhigh) | running; held by codex/conveyor-phase-1 |
 | 2 | Ship the CLI, queue, and typed API | 1 | workhorse (high) | |
 | 3 | Write public docs and clean up comments | 2 | workhorse (medium) | |
 | 4a | Rehearse install, upgrade, and release | 3 | deep (high) | |
