@@ -17,8 +17,8 @@ Conveyor should give maintainers and agents a reliable way to see what is waitin
 | Phase | What | After | Model | State |
 |---|---|---|---|---|
 | 0 | Settle scope and public contract | — | deep (xhigh) | landed; owner approved 2026-11-11 |
-| 1 | Harden merge, state, and recovery | 0 | deep (xhigh) | blocked (#1); GitHub-generated author identity fails the package gate; owner decision pending |
-| 2 | Ship the CLI, queue, and typed API | 1 | workhorse (high) | |
+| 1 | Harden merge, state, and recovery | 0 | deep (xhigh) | landed (#1); farrier passed; dynamite passed after fixes; Package gate passed at 7cc9bf8; live checks scheduled for Phase 4a |
+| 2 | Ship the CLI, queue, and typed API | 1 | workhorse (high) | running; held by codex/conveyor-phase-2 |
 | 3 | Write public docs and clean up comments | 2 | workhorse (medium) | |
 | 4a | Rehearse install, upgrade, and release | 3 | deep (high) | |
 | 4b | Polish CLI and docs | 4a; preview approved | workhorse (medium) | |
