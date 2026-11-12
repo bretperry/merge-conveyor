@@ -21,8 +21,8 @@ const minutes = (value) => (value < 120 ? `${Math.round(value)}m` : `${(value / 
 
 const hourOf = (now) => now.toISOString().slice(0, 13);
 
-// Every PR's state and base, for approvedWork's "merged counts as on dev". One call, and only when a
-// plan has approved work to check. Null when the read failed: an unknown PR would read as not on dev.
+// Read PR state and base when approved work needs checking. Null means the read failed;
+// an unknown PR must not be treated as absent from the base.
 const knownPrs = (work, run) => {
   if (work(new Map()).length === 0) return new Map();
   const result = run(["gh", "pr", "list", "--state", "all", "--limit", "1000", "--json", "number,state,baseRefName"]);
@@ -90,7 +90,7 @@ export const createWorker = (config, runtime) => {
   const UPDATE_FLIGHT_MINUTES = 60;
   const LOCK_HUNG_MINUTES = 120; // Legacy export. A live worker now keeps its lock until exit.
   const REPORT_DAYS = 7;
-  // The target this repo's flow is measured against: approved to on dev.
+  // Target timing from approval to the configured base.
   const TARGET_P50_MINUTES = 30;
   const TARGET_P90_MINUTES = 120;
   const HOOK_TIMEOUT_MS = 60_000;
@@ -225,7 +225,7 @@ export const createWorker = (config, runtime) => {
     return ahead > 0 ? { stale: true, why: `${BASE_BRANCH} advanced by ${ahead} commit(s)` } : { stale: false };
   };
 
-  // The ship freeze: a push to `dev` moves the open ship PR's head and cancels its checks.
+  // An open release PR freezes the base so its head and checks do not change.
   const shipState = (run) => {
     if (runtime && !runtime.shipFreeze) return { blocked: false };
     const result = run(["gh", "pr", "list", "--base", SHIP_BRANCH, "--head", BASE_BRANCH, "--state", "open", "--json", "number"]);
@@ -235,7 +235,7 @@ export const createWorker = (config, runtime) => {
   };
 
   // Why this clone can't be trusted to merge, or "". The hold list and the merge path run from its
-  // files with the token, so it must be exactly `dev`'s tip: not another branch, not behind, not edited.
+  // files with the token, so it must be exactly the base tip: not another branch, behind, or edited.
   const cloneProblem = (cwd, run) => {
     const branch = run(["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"]);
     if (branch.status !== 0) return "can't read the worker's branch";
@@ -338,7 +338,7 @@ export const createWorker = (config, runtime) => {
       },
     });
 
-  // Reads `dev`'s CI and alarms on it, every tick: a red `dev` matters with no PR waiting and commando off too.
+  // Check base CI during an active tick, even when no PR is waiting.
   const watchDev = ({ run, now, state, alarm }) => {
     const dev = devState(run);
     if (dev.green) {

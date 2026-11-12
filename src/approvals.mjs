@@ -97,7 +97,7 @@ export const createApprovals = ({ HOLD_PATTERNS, MAX_PR_FILES, heldBy, pathsHeld
   // Knobs: how long a yes lasts, and the log's name in the common git dir.
   const APPROVAL_HOURS = 24;
   const APPROVALS_LOG = approvalsLog;
-  // The classes commando holds.
+  // The configured classes of held paths.
   const HOLD_CLASSES = [...new Set(HOLD_PATTERNS.map(([, why]) => why))];
 
   const validScope = (scope) => scope === "merge" || (scope?.startsWith("hold:") && HOLD_CLASSES.includes(scope.slice(5)));
@@ -129,7 +129,7 @@ export const createApprovals = ({ HOLD_PATTERNS, MAX_PR_FILES, heldBy, pathsHeld
 
   // A fingerprint of one held class's change: which of its files changed and their exact content, by
   // blob id. No diff text to parse, so another file can't forge a held file's entry. Any edit to a held
-  // path changes it, a push elsewhere doesn't, and a `dev` merge changes it only if it changes those
+  // path changes it, a push elsewhere doesn't, and a base merge changes it only if it changes those
   // files. The tree mode counts too: dropping a hook's exec bit changes what runs. Null, which only a
   // matching head can satisfy, when it can't vouch for every held path.
   const heldDigest = (files, why) => (files.length >= MAX_PR_FILES ? null : changeDigest(files.filter((file) => pathsHeld(filePaths([file]), why).length > 0)));

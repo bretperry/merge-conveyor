@@ -24,3 +24,5 @@ not evidence: the gate that counts is the run on `main` after the merge. Read th
 `.github/` and `.githooks/`: changes to those paths need the owner's review. Dependabot PRs come from the same repo but receive no
 Actions secret, so the full gate fails with a blank term list. Rerun or merge them after the gate passes on `main`,
 or add `HARNESS_DENYLIST` as a Dependabot secret too.
+
+For maintainers working on the package, use Node.js 22 or later and run `npm test` from the repository root. Document user-visible changes and keep examples aligned with the CLI help and `src/index.d.mts`. Report security issues using the process above rather than including credentials or private repository data in a report.

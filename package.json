@@ -18,7 +18,13 @@
     }
   },
   "files": [
-    "src/"
+    "src/",
+    "docs/agent-walkthrough.md",
+    "docs/api.md",
+    "docs/operator-recovery.md",
+    "examples/conveyor.json",
+    "CONTRIBUTING.md",
+    "SECURITY.md"
   ],
   "scripts": {
     "test": "node --test"
