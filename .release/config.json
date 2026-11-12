@@ -1,4 +1,7 @@
 {
-  "binary": [],
+  "binary": [
+    ".DS_Store",
+    ".release/.DS_Store"
+  ],
   "allow": []
 }

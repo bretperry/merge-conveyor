@@ -9,7 +9,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/bretperry/conveyor"
+    "url": "https://github.com/bretperry/merge-conveyor"
   },
   "exports": {
     ".": {
