@@ -46,7 +46,7 @@ const terminal = (snap) => {
   if (snap.error) return "";
   if (snap.state !== "OPEN") return `PR is ${snap.state}`;
   if (snap.base !== snap.wantBase) return `base is '${snap.base}', not '${snap.wantBase}'; refusing`;
-  // A caller that vetted one exact head (commando's hold list) gets that head or nothing.
+  // A caller that vetted one exact head gets that head or nothing.
   if (snap.wantHead && snap.head !== snap.wantHead) return `head moved ${short(snap.wantHead)} -> ${short(snap.head)} since it was checked; refusing`;
   return "";
 };
