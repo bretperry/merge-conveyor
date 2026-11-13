@@ -1,0 +1,59 @@
+# Mirrors each npm release to GitHub Packages as @<owner>/<repo name>, so it shows on the GitHub profile and repo page.
+# Copies the exact tarball npm already serves and renames it; nothing is rebuilt.
+# Trigger: after the npm publish workflow succeeds on a v* tag, or by hand with a version already on npm.
+# Needs: nothing. The job's GITHUB_TOKEN publishes, which links the package to this repo.
+
+name: GitHub Packages
+
+on:
+  workflow_run:
+    workflows: [Publish, release]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version already on npm, e.g. 0.1.0"
+        required: true
+
+permissions: {}
+
+jobs:
+  mirror:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.head_branch, 'v'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: lts/*
+      - name: Copy the npm tarball to GitHub Packages
+        env:
+          NAME: ${{ github.event.repository.name }}
+          OWNER: ${{ github.repository_owner }}
+          VERSION_IN: ${{ inputs.version }}
+          TAG: ${{ github.event.workflow_run.head_branch }}
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          v="${VERSION_IN:-${TAG#v}}"
+          scope="$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          cd "$(mktemp -d)"
+          # npm can take a minute to serve a version it just accepted.
+          for i in 1 2 3 4 5 6; do npm pack "$NAME@$v" && break; sleep 20; done
+          tar xzf ./*.tgz
+          cd package
+          node -e '
+            const fs = require("fs");
+            const p = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            p.name = `@${process.argv[1]}/${p.name}`;
+            p.publishConfig = { registry: "https://npm.pkg.github.com" };
+            fs.writeFileSync("package.json", JSON.stringify(p, null, 2) + "\n");
+          ' "$scope"
+          echo "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}" > .npmrc
+          if npm view "@$scope/$NAME@$v" version --registry https://npm.pkg.github.com >/dev/null 2>&1; then
+            echo "@$scope/$NAME@$v already on GitHub Packages"; exit 0
+          fi
+          npm publish --ignore-scripts --registry https://npm.pkg.github.com
