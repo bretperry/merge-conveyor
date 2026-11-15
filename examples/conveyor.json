@@ -1,0 +1,5 @@
+{
+  "base": "main",
+  "baseWorkflow": "ci.yml",
+  "clearancePublisherId": 123456
+}
