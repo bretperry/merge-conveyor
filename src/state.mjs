@@ -84,6 +84,9 @@ const pidAlive = (pid) => {
   }
 };
 
+// How often a held lock refreshes its file-style twin; the older timer calls a file lock hung after 120 minutes still.
+const LEGACY_BEAT_MS = 60_000;
+
 export const takeLock = (path) => {
   // Each contender publishes its PID and unique ownership in one atomic mkdir, then checks for
   // competitors. At worst simultaneous starters both yield. A contender only reaps dead owners
@@ -111,8 +114,35 @@ export const takeLock = (path) => {
       if (!Number.isInteger(pid) || pid <= 0 || pidAlive(pid)) return null;
       rmSync(candidate, { recursive: true, force: true });
     }
+    // The file-style lock too, so an older timer that reads only `path` (a JSON {pid, at} it takes with `wx`)
+    // stands down while this tick runs. A dead holder's file was ruled out above; `wx` loses to one written since.
+    if (legacy !== undefined) rmSync(path, { force: true });
+    const text = () => JSON.stringify({ pid: process.pid, at: new Date().toISOString() });
+    try {
+      writeFileSync(path, text(), { flag: "wx", mode: 0o600 });
+    } catch (error) {
+      if (error.code === "EEXIST") return null;
+      throw error;
+    }
+    // The older timer reaps a file lock whose `at` stops moving (it reads that as a hung tick), so keep it moving.
+    const beat = setInterval(() => {
+      try {
+        if (parseJson(readFileSync(path, "utf8"))?.pid === process.pid) writeFileSync(path, text());
+      } catch {
+        // A beat that fails leaves the older timer to judge the lock by its age; this tick's own lock holds.
+      }
+    }, LEGACY_BEAT_MS);
+    beat.unref();
     acquired = true;
-    return release;
+    return () => {
+      clearInterval(beat);
+      try {
+        if (parseJson(readFileSync(path, "utf8"))?.pid === process.pid) rmSync(path, { force: true });
+      } catch {
+        // Already gone.
+      }
+      release();
+    };
   } finally {
     if (!acquired) release();
   }

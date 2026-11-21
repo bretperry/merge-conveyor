@@ -3,7 +3,7 @@
 // Exports: createApprovals.
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { isAbsolute, join } from "node:path";
+import { basename, isAbsolute, join } from "node:path";
 
 import { isSha, parseJson } from "./github.mjs";
 // The common git dir, so a worktree and its primary clone share one log.
@@ -93,10 +93,14 @@ const pinnedFiles = ({ base, head, changedFiles }, run) => {
   return new Set(files.map((file) => file.path)).size === files.length ? files : null;
 };
 
-export const createApprovals = ({ HOLD_PATTERNS, MAX_PR_FILES, heldBy, pathsHeld, approvalsLog = "conveyor-approvals.log", boundedReads = false }) => {
+export const createApprovals = ({ HOLD_PATTERNS, MAX_PR_FILES, heldBy, pathsHeld, approvalsLog = "conveyor-approvals.log", approvalsLogAliases = [], boundedReads = false }) => {
   // Knobs: how long a yes lasts, and the log's name in the common git dir.
   const APPROVAL_HOURS = 24;
   const APPROVALS_LOG = approvalsLog;
+  // Older names of the log, read as well (a yes recorded under one still counts); writes go to APPROVALS_LOG.
+  if (!Array.isArray(approvalsLogAliases) || !approvalsLogAliases.every((name) => typeof name === "string" && name.length > 0 && name !== "." && name !== ".." && name === basename(name))) {
+    throw new TypeError("approvalsLogAliases must be a list of filenames");
+  }
   // The configured classes of held paths.
   const HOLD_CLASSES = [...new Set(HOLD_PATTERNS.map(([, why]) => why))];
 
@@ -107,11 +111,10 @@ export const createApprovals = ({ HOLD_PATTERNS, MAX_PR_FILES, heldBy, pathsHeld
   // The records still in force: written, not expired, and not more than the cap ahead (a hand-edited
   // expiry reads as void). Unparseable lines are skipped.
   const activeApprovals = (dir, now) => {
-    const path = join(dir, APPROVALS_LOG);
-    if (!existsSync(path)) return [];
+    const paths = [APPROVALS_LOG, ...approvalsLogAliases].map((name) => join(dir, name)).filter((path) => existsSync(path));
     const latest = now.getTime() + APPROVAL_HOURS * 3600 * 1000;
-    return readFileSync(path, "utf8")
-      .split("\n")
+    return paths
+      .flatMap((path) => readFileSync(path, "utf8").split("\n"))
       .flatMap((line) => {
         try {
           const record = JSON.parse(line);

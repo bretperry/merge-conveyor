@@ -21,14 +21,23 @@ test("the approvals module carries no private project name", () => {
 });
 
 // Match the same import forms as the conveyor's existing hold-closure test.
-// Computed imports are refused because their targets cannot be checked statically.
+// Computed imports are refused because their targets cannot be checked statically, except the one that
+// loads the operator's own config module in embedded mode (src/embedded.mjs `load`).
+const OPERATOR_CONFIG_IMPORT = { file: "embedded.mjs", argument: "url" };
 const imports = (file) => {
   const source = readFileSync(file, "utf8").replace(/^[ \t]*\/\/.*$/gm, "");
   for (const call of source.matchAll(/\b(?:import|require)\s*\(([^)]*)\)/g)) {
+    if (relative(root, file) === OPERATOR_CONFIG_IMPORT.file && call[1].trim() === OPERATOR_CONFIG_IMPORT.argument) continue;
     assert.match(call[1].trim(), /^(["'])[^"']+\1$/, `${file}: computed import`);
   }
   return [...source.matchAll(/(?:from\s+|import\s*\(\s*|require\s*\(\s*|^import\s+)["']([^"']+)["']/gm)].map((match) => match[1]);
 };
+
+test("embedded mode has exactly one computed import, of the operator's config", () => {
+  const source = readFileSync(join(root, OPERATOR_CONFIG_IMPORT.file), "utf8").replace(/^[ \t]*\/\/.*$/gm, "");
+  assert.equal([...source.matchAll(/\bimport\s*\(\s*url\s*\)/g)].length, 1);
+  assert.equal([...source.matchAll(/\b(?:import|require)\s*\(/g)].length, 1);
+});
 
 test("every conveyor runtime import stays in the package source or Node builtins", () => {
   const files = readdirSync(root, { recursive: true }).filter((name) => name.endsWith(".mjs") && !name.endsWith(".test.mjs"));
