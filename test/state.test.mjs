@@ -1,8 +1,8 @@
 // Verify lock recovery after a separate worker process is killed.
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -31,4 +31,24 @@ test("a live process excludes another tick and a killed owner can be reclaimed",
   const release = takeLock(path);
   assert.equal(typeof release, "function");
   release();
+});
+
+test("the lock also holds the older file-style lock, so an older timer stands down", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "conveyor-lock-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, "worker.lock");
+  const release = takeLock(path);
+  assert.equal(JSON.parse(readFileSync(path, "utf8")).pid, process.pid);
+  release();
+  assert.equal(existsSync(path), false);
+  // A live holder's file lock refuses; a dead one's is replaced.
+  writeFileSync(path, JSON.stringify({ pid: process.ppid, at: new Date().toISOString() }));
+  assert.equal(takeLock(path), null);
+  assert.equal(JSON.parse(readFileSync(path, "utf8")).pid, process.ppid);
+  const dead = spawnSync(process.execPath, ["-e", ""]).pid;
+  writeFileSync(path, JSON.stringify({ pid: dead, at: new Date().toISOString() }));
+  const again = takeLock(path);
+  assert.equal(typeof again, "function");
+  assert.equal(JSON.parse(readFileSync(path, "utf8")).pid, process.pid);
+  again();
 });

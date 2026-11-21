@@ -83,13 +83,17 @@ const fixture = (t, config = {}) => {
     clearedContext: CONTEXT, clearancePublisherId: 100, stateName: "worker", ageAlarms: { pokeHours: 2, tellHours: 4 },
     ...config,
     adapters: {
-      approved: (_dir, now, scope) => model.holdApproval && now < model.holdUntil && scope.scope === "hold:migrations",
+      approved: (_dir, now, scope) => (model.holdApproval && now < model.holdUntil && scope.scope === "hold:migrations") ||
+        (scope.scope === "merge" && scope.pr === "1" && scope.head === model.mergeApprovalHead),
       changeDigest: () => null,
       gitDir: () => dir,
       heldDigest: () => null,
       readHeld: () => model.heldRead ?? { head: model.pr.headRefOid, paths: model.changed, files: model.changed.map((path) => ({ path })) },
       activeUntil: () => model.until,
-      commando: (_args, opts) => opts.merge(["1"], { wantHead: model.pr.headRefOid }),
+      commando: (_args, opts) => {
+        model.consent = opts.consent;
+        return opts.merge(["1"], { wantHead: model.pr.headRefOid });
+      },
       heldBy: (paths) => paths.some((path) => path.includes("migrations/")) ? ["migrations"] : [],
       isGateContext: (context) => context.startsWith("gate/"),
       wrangleMerge: async (_args, opts) => {
@@ -365,4 +369,146 @@ test("dry run is read-only and clear requires a full exact head", async (t) => {
   assert.equal(await f.run("clear", "1", HEAD), 0);
   assert.equal(f.model.writes.length, 1);
   assert.ok(f.model.writes[0].includes(`repos/{owner}/{repo}/statuses/${HEAD}`));
+});
+
+test("a state file under an older name still counts, and the next write goes to the current name", async (t) => {
+  const f = fixture(t, { stateAliases: ["older-worker"] });
+  writeFileSync(join(f.dir, "older-worker.json"), JSON.stringify({ lastTickAt: "2025-12-31T00:00:00.000Z" }));
+  assert.equal(await f.run("status"), 0);
+  assert.ok(f.model.lines.includes("last tick 2025-12-31T00:00:00.000Z"), f.model.lines.join("\n"));
+  await f.run("tick");
+  assert.ok(existsSync(f.statePath));
+  assert.equal(f.state().lastTickAt, START);
+  // The first save moved the older file, so the second tick finds one name, not two.
+  assert.equal(existsSync(join(f.dir, "older-worker.json")), false);
+  f.model.now += 60_000;
+  assert.notEqual(await f.run("tick"), 3, f.model.lines.join("\n"));
+  assert.equal(f.state().lastTickAt, new Date(f.model.now).toISOString());
+});
+
+test("state files under two names refuse the tick", async (t) => {
+  const f = fixture(t, { stateAliases: ["older-worker"] });
+  writeFileSync(join(f.dir, "older-worker.json"), JSON.stringify({ lastTickAt: "2025-12-31T00:00:00.000Z" }));
+  writeFileSync(f.statePath, JSON.stringify({ lastTickAt: "2025-12-30T00:00:00.000Z" }));
+  assert.equal(await f.run("tick"), 3);
+  assert.match(f.model.lines.join("\n"), /both exist/);
+});
+
+test("stateAliases must be filename stems", (t) => {
+  for (const value of ["old", [""], [3], ["a/b"], ["."], [".."]]) assert.throws(() => fixture(t, { stateAliases: value }), /stateAliases/);
+});
+
+test("stateAliases must be distinct and differ from stateName", (t) => {
+  const f = fixture(t);
+  const stem = f.conveyor.STATE_NAME.replace(/\.json$/u, "");
+  for (const value of [[stem], ["old", "old"]]) assert.throws(() => fixture(t, { stateAliases: value }), /distinct names/);
+});
+
+test("an unknown config field is an error, not ignored", (t) => {
+  assert.throws(() => fixture(t, { lane: { pass: () => {} } }), /lane must be a known config field/);
+});
+
+test("status --json prints one document with the switch, the last tick and each PR", async (t) => {
+  const f = fixture(t);
+  assert.equal(await f.run("status", "--json"), 0);
+  assert.equal(f.model.lines.length, 1);
+  const { ok: isOk, value } = JSON.parse(f.model.lines[0]);
+  assert.equal(isOk, true);
+  assert.equal(value.schemaVersion, 1);
+  assert.equal(value.version, JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version);
+  assert.deepEqual(value.switch, { variable: "ACTIVE", on: true, value: "on", unreadable: false, why: null });
+  assert.equal(value.base, BASE);
+  assert.equal(value.lastTickAt, null);
+  assert.deepEqual(value.prs.map(({ number, headSha }) => ({ number, headSha })), [{ number: 1, headSha: HEAD }]);
+  assert.equal(value.baseGreen.green, true);
+  assert.equal(await f.run("status", "--jsn"), 2);
+});
+
+test("status --json reports a failed read as one error document", async (t) => {
+  const f = fixture(t);
+  f.model.onCall = (argv) => (argv[1] === "pr" && argv[2] === "list" ? failure : undefined);
+  assert.equal(await f.run("status", "--json"), 1);
+  assert.equal(f.model.lines.length, 1);
+  assert.equal(JSON.parse(f.model.lines[0]).ok, false);
+});
+
+test("status --json reports an unreadable state file as one state_corrupt document", async (t) => {
+  const f = fixture(t);
+  writeFileSync(f.statePath, "{not json");
+  assert.equal(await f.run("status", "--json"), 1);
+  assert.deepEqual(JSON.parse(f.model.lines[0]).error.code, "state_corrupt");
+});
+
+test("state under both the current and an older name refuses instead of picking one", async (t) => {
+  const f = fixture(t, { stateAliases: ["older-worker"] });
+  writeFileSync(f.statePath, JSON.stringify({ lastTickAt: START }));
+  writeFileSync(join(f.dir, "older-worker.json"), JSON.stringify({ lastTickAt: START }));
+  assert.equal(await f.run("tick"), 3);
+  assert.match(f.model.lines.join("\n"), /older-worker\.json both exist/);
+  assert.equal(f.model.writes.length, 0);
+});
+
+test("a tick holding an older name's lock keeps the new name's tick out", async (t) => {
+  const f = fixture(t, { stateAliases: ["older-worker"] });
+  // The old in-tree conveyor's lock: a file holding its live PID.
+  writeFileSync(join(f.dir, "older-worker.lock"), JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
+  assert.equal(await f.run("tick"), 0);
+  assert.match(f.model.lines.join("\n"), /another tick is running|lock/);
+  assert.equal(f.model.writes.length, 0);
+  assert.ok(!existsSync(f.statePath));
+});
+
+test("with the window off, a merge approval at the PR's exact head merges that PR alone", async (t) => {
+  const f = fixture(t, { mergeApprovals: true });
+  f.model.until = null;
+  assert.equal(await f.run("tick", "--dry-run"), 0);
+  assert.ok(f.model.lines.some((line) => /merge nothing: conveyor is paused/.test(line)), f.model.lines.join("\n"));
+  f.model.lines.length = 0;
+  f.model.mergeApprovalHead = NEW_HEAD;
+  await f.run("tick");
+  assert.equal(f.model.writes.length, 0, "an approval at another head is no approval");
+  f.model.mergeApprovalHead = HEAD;
+  await f.run("tick");
+  assert.equal(f.model.writes.length, 1, f.model.lines.join("\n"));
+  assert.ok(f.model.writes[0].some((arg) => arg.endsWith("/pulls/1/merge")), f.model.writes[0].join(" "));
+  assert.equal(f.model.consent, "approval");
+});
+
+test("a merge approval never covers an update: a stale approved PR waits with the window off", async (t) => {
+  const f = fixture(t, { autoUpdate: true, mergeApprovals: true });
+  f.model.until = null;
+  f.model.mergeApprovalHead = HEAD;
+  f.model.ahead = 1;
+  await f.run("tick");
+  assert.equal(f.model.writes.length, 0, f.model.lines.join("\n"));
+});
+
+test("without mergeApprovals, a merge approval merges nothing with the window off", async (t) => {
+  const f = fixture(t);
+  f.model.until = null;
+  f.model.mergeApprovalHead = HEAD;
+  await f.run("tick");
+  assert.equal(f.model.writes.length, 0, f.model.lines.join("\n"));
+  assert.equal(f.model.consent, undefined);
+});
+
+test("mergeApprovals must be a boolean", (t) => {
+  assert.throws(() => fixture(t, { mergeApprovals: "yes" }), /mergeApprovals must be a boolean/);
+});
+
+test("a paused switch beats a merge approval, before the tick and at the last read", async (t) => {
+  for (const [name, setup] of [
+    ["paused before the tick", (m) => { m.switchValue = "off"; }],
+    ["paused at the last read", (m) => { m.beforeWrite = () => { m.switchValue = "off"; }; }],
+  ]) {
+    await t.test(name, async (caseTest) => {
+      const f = fixture(caseTest, { mergeApprovals: true });
+      f.model.until = null;
+      f.model.mergeApprovalHead = HEAD;
+      setup(f.model);
+      assert.equal(await f.run("tick"), 0);
+      assert.equal(f.model.writes.length, 0, f.model.lines.join("\n"));
+      assert.equal(f.state().operation, undefined);
+    });
+  }
 });

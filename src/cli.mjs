@@ -1,8 +1,10 @@
 import { readFileSync } from "node:fs";
+import { createInterface } from "node:readline/promises";
 import { parseArgs } from "node:util";
 
 import { createClient, EXIT_CODES } from "./client.mjs";
 import { isSha } from "./github.mjs";
+import { MIN_SIZE, runWatch } from "./watch.mjs";
 
 const HELP = `Usage: conveyor <command> [--json] [--config PATH]
 
@@ -11,11 +13,15 @@ const HELP = `Usage: conveyor <command> [--json] [--config PATH]
   status                  Show worker health, consent and last action
   doctor                  Check the checkout, GitHub access and branch protection
   report [--days N]        Summarize merge times over 1–90 days (default 7)
+  watch [--calm]           Live full-screen view of the queue and worker (read-only, needs a terminal)
   tick --dry-run           Preview the next action without writing
   tick                    Run one worker tick
   clear <pr> <sha>         Record clearance for the full reviewed head SHA
   pause                   Pause the local worker
   resume                  Grant expiring consent to the local worker
+  window on <hours>       Grant consent for 1–168 hours (a typed yes at a terminal)
+  window off              Same as pause
+  approve <pr> [<pr> …]   Record a 24-hour yes for each held class a PR touches (a typed yes at a terminal)
   --help                  Show this help
   --version               Show the installed package version
 
@@ -124,18 +130,44 @@ const format = (command, value, columns) => {
     case "clear": return value.kind === "unknown" ? [visible(value.reason.message)] :
       [`#${value.number} ${value.kind === "cleared" ? "cleared" : "already cleared"} at ${value.headSha}.`];
     case "pause": return ["Conveyor is paused."];
+    case "window": return value.kind === "paused" ? ["Conveyor is paused."] : [`Conveyor consent expires at ${value.consentUntil}.`];
+    case "approve": return [
+      ...value.approvals.map(({ number, headSha, classes }) => `#${number} approved at ${headSha.slice(0, 12)}: ${classes.join(", ")}.`),
+      `Each yes lasts until ${value.expires}; a push that changes those held paths needs a new one.`,
+    ];
     case "resume": return [`Conveyor consent expires at ${value.consentUntil}.`];
     default: throw new Error("Unsupported CLI operation");
   }
 };
 
 const integer = (value) => typeof value === "string" && /^[1-9]\d*$/u.test(value) && Number.isSafeInteger(Number(value)) ? Number(value) : null;
-const commands = new Set(["queue", "explain", "status", "doctor", "report", "tick", "clear", "pause", "resume"]);
+const commands = new Set(["queue", "explain", "status", "doctor", "report", "tick", "clear", "pause", "resume", "window", "approve", "watch"]);
+
+const CONFIRM_WORD = "yes";
+// What this check guarantees: the yes was typed on a terminal. It stops a plain non-interactive shell (no TTY).
+// It does not stop a process that drives a pseudo-terminal, a caller that passes its own `confirm`, or anyone
+// who can edit the consent file or the approvals log: those are the same user's files.
+// The prompt goes to `output`, which is stderr under --json so stdout stays one JSON document.
+export const typed = async (question, { input = process.stdin, output = process.stdout } = {}) => {
+  if (!input.isTTY || !output.isTTY) return false;
+  const rl = createInterface({ input, output });
+  try {
+    return (await rl.question(question)).trim() === CONFIRM_WORD;
+  } finally {
+    rl.close();
+  }
+};
+export const makeConfirm = (io) => ({
+  window: ({ hours, repo, base }) => typed(`Let Conveyor merge into ${visible(base)} of ${visible(repo)} for ${hours}h without you. Type "${CONFIRM_WORD}" to confirm: `, io),
+  approve: ({ approvals, hours }) => typed(`${approvals.map(({ number, headSha, classes }) => `#${number} at ${headSha.slice(0, 12)}: ${classes.join(", ")}`).join("\n")}\nApprove the above for ${hours}h. Type "${CONFIRM_WORD}" to confirm: `, io),
+});
 
 export const runCli = async (argv, {
   clientFactory = createClient,
   stdout = process.stdout,
   stderr = process.stderr,
+  stdin = process.stdin,
+  confirm,
 } = {}) => {
   const emit = (stream, text) => stream.write(`${text}\n`);
   const usage = (message) => {
@@ -148,7 +180,7 @@ export const runCli = async (argv, {
     parsed = parseArgs({
       args: argv, allowPositionals: true, options: {
         json: { type: "boolean" }, config: { type: "string" }, days: { type: "string" },
-        "dry-run": { type: "boolean" }, help: { type: "boolean", short: "h" }, version: { type: "boolean", short: "v" },
+        "dry-run": { type: "boolean" }, calm: { type: "boolean" }, help: { type: "boolean", short: "h" }, version: { type: "boolean", short: "v" },
       },
     });
   } catch {
@@ -164,7 +196,17 @@ export const runCli = async (argv, {
     return EXIT_CODES.ok;
   }
   if (!commands.has(command) || values.version || (values["dry-run"] && command !== "tick") ||
-    (values.days !== undefined && command !== "report")) return usage("Invalid command or option.");
+    (values.days !== undefined && command !== "report") || (values.calm && command !== "watch")) return usage("Invalid command or option.");
+  if (command === "watch") {
+    if (values.json || args.length > 0) return usage("watch takes only --calm and --config.");
+    if (!stdout.isTTY || !process.stdin.isTTY) return usage("watch needs a terminal. Use queue --json or status --json for scripts.");
+    if (stdout.columns < MIN_SIZE.cols || stdout.rows < MIN_SIZE.rows) return usage(`watch needs a terminal of at least ${MIN_SIZE.cols}×${MIN_SIZE.rows}.`);
+    const watched = await runWatch({ client: clientFactory({ configPath: values.config }), configPath: values.config, stdout, calm: values.calm });
+    if (watched.ok) return EXIT_CODES.ok;
+    emit(stderr, visible(watched.error.message));
+    return watched.error.code === "invalid_input" ? EXIT_CODES.usage : EXIT_CODES.error;
+  }
+  const ask = confirm ?? makeConfirm({ input: stdin, output: values.json ? stderr : stdout });
   let input;
   if (command === "explain" || command === "clear") {
     const [pr, headSha] = args;
@@ -173,6 +215,14 @@ export const runCli = async (argv, {
       return usage(command === "clear" ? "Use conveyor clear <pr> <full reviewed SHA>." : "Use conveyor explain <pr>.");
     }
     input = { number, ...(headSha ? { headSha } : {}) };
+  } else if (command === "window") {
+    const hours = args[0] === "off" && args.length === 1 ? "off" : args[0] === "on" && args.length === 2 ? integer(args[1]) : null;
+    if (hours === null || (hours !== "off" && hours > 168)) return usage("Use conveyor window on <1-168 hours> or conveyor window off.");
+    input = { hours, confirm: ask.window };
+  } else if (command === "approve") {
+    const numbers = args.map(integer);
+    if (numbers.length === 0 || numbers.includes(null)) return usage("Use conveyor approve <pr> [<pr> …].");
+    input = { numbers, confirm: ask.approve };
   } else if (args.length > 0) return usage("Unexpected argument.");
   if (command === "report" && values.days !== undefined) {
     const days = integer(values.days);
@@ -183,7 +233,7 @@ export const runCli = async (argv, {
   const progress = {
     queue: "Reading GitHub…", preview: "Previewing the next action…", explain: "Reading GitHub…",
     status: "Checking worker status…", doctor: "Checking Conveyor setup…", report: "Reading merge history…",
-    tick: "Running one worker tick…", clear: "Recording clearance for the reviewed head…",
+    tick: "Running one worker tick…", approve: "Reading the pull requests…", clear: "Recording clearance for the reviewed head…",
   }[action];
   if (stderr.isTTY && progress) emit(stderr, progress);
   const client = clientFactory({ configPath: values.config });

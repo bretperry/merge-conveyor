@@ -5,7 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { formatQueue, runCli } from "../src/cli.mjs";
+import { PassThrough } from "node:stream";
+
+import { formatQueue, makeConfirm, runCli, typed } from "../src/cli.mjs";
 import { createClient } from "../src/index.mjs";
 
 const BASE = "a".repeat(40);
@@ -36,7 +38,7 @@ const fixture = (t, options = {}) => {
   const dir = join(cwd, ".git");
   mkdirSync(dir);
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
-  const model = { prs: [pull()], calls: [], writes: [], time: Date.parse(START), viewer: 100, cleared: true, stale: new Set(), paths: new Map() };
+  const model = { prs: [pull()], calls: [], writes: [], time: Date.parse(START), mono: 0, viewer: 100, cleared: true, stale: new Set(), paths: new Map() };
   const find = (number) => model.prs.find((pr) => pr.number === Number(number));
   const auth = () => model.prs.map((pr) => ({ context: clearance(pr.number).context, state: "success", creator: { id: 100 } }));
   const run = (argv, context) => {
@@ -73,7 +75,7 @@ const fixture = (t, options = {}) => {
       if (verb.includes("/rules/branches/")) return ok([{ type: "required_status_checks", parameters: {
         strict_required_status_checks_policy: true, required_status_checks: [{ context: "Build" }],
       } }]);
-      if (verb.includes("/git/trees/")) return ok([false, []]);
+      if (verb.includes("/git/trees/")) return ok([false, [...model.paths.values()].map((path) => [path, "100644"])]);
       if (verb === "--method") {
         model.writes.push(argv);
         if (model.onWrite) return model.onWrite(argv);
@@ -84,7 +86,7 @@ const fixture = (t, options = {}) => {
     assert.fail(`unexpected command: ${argv.join(" ")}`);
   };
   const client = createClient({ cwd, config: { clearancePublisherId: 100, ...options.config }, ...options.hooks },
-    { run, clock: () => new Date(model.time) });
+    { run, clock: () => new Date(model.time), monotonic: () => model.mono });
   return { client, model, dir, statePath: join(dir, "conveyor.json") };
 };
 
@@ -411,4 +413,226 @@ test("CLI JSON is one result with stable exit codes and sanitized read errors", 
   assert.equal(broken.code, 1);
   assert.equal(JSON.parse(broken.stdout).value.stateHealth, "corrupt");
   assert.equal(readFileSync(f.statePath, "utf8"), "{broken");
+});
+
+test("window needs a confirm, runs up to 168 hours, and is capped there", async (t) => {
+  const f = fixture(t);
+  assert.equal((await f.client.window({ hours: 48 })).error.code, "confirmation_required");
+  assert.equal((await f.client.window({ hours: 48, confirm: () => false })).error.code, "confirmation_required");
+  assert.equal((await f.client.window({ hours: 169, confirm: () => true })).error.code, "invalid_input");
+  assert.equal((await f.client.window({ hours: 0, confirm: () => true })).error.code, "invalid_input");
+  assert.equal(value(await f.client.status()).consentUntil ?? null, null);
+  const opened = value(await f.client.window({ hours: 168, confirm: () => true }));
+  assert.equal(opened.consentUntil, new Date(f.model.time + 168 * 3_600_000).toISOString());
+  assert.equal(value(await f.client.status()).consentUntil, opened.consentUntil);
+  f.model.time += 100 * 3_600_000;
+  assert.equal(value(await f.client.status()).consentUntil, opened.consentUntil);
+  f.model.time += 69 * 3_600_000;
+  assert.equal(value(await f.client.status()).consentUntil ?? null, null);
+  value(await f.client.window({ hours: 24, confirm: () => true }));
+  assert.equal(value(await f.client.window({ hours: "off" })).kind, "paused");
+  assert.equal(value(await f.client.tick()).reason.code, "paused");
+});
+
+test("window refuses a hand-edited expiry past its cap", async (t) => {
+  const f = fixture(t);
+  value(await f.client.resume());
+  const path = join(f.dir, "conveyor-consent.json");
+  const record = JSON.parse(readFileSync(path, "utf8"));
+  writeFileSync(path, JSON.stringify({ ...record, until: new Date(f.model.time + 100 * 3_600_000).toISOString() }));
+  assert.equal(value(await f.client.status()).consentUntil ?? null, null);
+});
+
+test("approve records a 24-hour yes per held class at the head it showed", async (t) => {
+  const f = fixture(t);
+  f.model.paths.set(1, "package.json");
+  assert.equal((await f.client.approve({ numbers: [1] })).error.code, "confirmation_required");
+  let shown;
+  const done = value(await f.client.approve({ numbers: [1], confirm: (input) => { shown = input; return true; } }));
+  assert.deepEqual(shown.approvals, [{ number: 1, headSha: HEAD, classes: ["dependencies"] }]);
+  assert.equal(done.expires, new Date(f.model.time + 24 * 3_600_000).toISOString());
+  const lines = readFileSync(join(f.dir, "conveyor-approvals.log"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(lines.length, 1);
+  assert.deepEqual([lines[0].pr, lines[0].scope, lines[0].head, lines[0].expires], [1, "hold:dependencies", HEAD, done.expires]);
+});
+
+test("approve records nothing when declined, moved, unheld, or not open", async (t) => {
+  const f = fixture(t);
+  const log = join(f.dir, "conveyor-approvals.log");
+  const none = () => assert.throws(() => readFileSync(log), { code: "ENOENT" });
+  f.model.paths.set(1, "package.json");
+  assert.equal((await f.client.approve({ numbers: [1], confirm: () => false })).error.code, "confirmation_required");
+  assert.equal((await f.client.approve({ numbers: [1], confirm: () => { f.model.prs[0] = pull(1, HEAD2); return true; } })).error.code, "stale_head");
+  f.model.paths.set(1, "src/file.mjs");
+  assert.equal((await f.client.approve({ numbers: [1], confirm: () => true })).error.code, "invalid_input");
+  f.model.paths.set(1, "package.json");
+  f.model.prs[0].state = "MERGED";
+  assert.equal((await f.client.approve({ numbers: [1], confirm: () => true })).error.code, "data_unavailable");
+  assert.equal((await f.client.approve({ numbers: [1, 1], confirm: () => true })).error.code, "invalid_input");
+  none();
+});
+
+test("the CLI routes window and approve through a typed confirm", async () => {
+  const calls = [];
+  const client = { window: async (input) => { calls.push(["window", input.hours, input.confirm]); return { ok: true, value: { kind: "resumed", changed: true, consentUntil: "2026-01-02T00:00:00.000Z" } }; },
+    approve: async (input) => { calls.push(["approve", input.numbers, input.confirm]); return { ok: true, value: { approvals: [{ number: 4, headSha: HEAD, classes: ["CI"] }], expires: "2026-01-02T00:00:00.000Z" } }; } };
+  const out = [];
+  const io = () => ({ stdout: { write: (text) => out.push(text), columns: 80 }, stderr: { write: (text) => out.push(text) }, clientFactory: () => client });
+  const marker = () => true;
+  assert.equal(await runCli(["window", "on", "168"], { ...io(), confirm: { window: marker, approve: marker } }), 0);
+  assert.equal(await runCli(["approve", "4", "5"], { ...io(), confirm: { window: marker, approve: marker } }), 0);
+  assert.deepEqual(calls.map(([name, arg, confirm]) => [name, arg, confirm === marker]), [["window", 168, true], ["approve", [4, 5], true]]);
+  for (const argv of [["window"], ["window", "on", "169"], ["window", "on"], ["window", "off", "1"], ["approve"], ["approve", "x"]]) {
+    assert.equal(await runCli(argv, io()), 2, argv.join(" "));
+  }
+  // Without a terminal the default confirm declines.
+  const refused = { window: async () => ({ ok: false, error: { code: "confirmation_required", message: "no" } }) };
+  assert.equal(await runCli(["window", "on", "2"], { ...io(), clientFactory: () => refused }), 1);
+});
+
+test("approve's confirm wait does not count against the read budget", async (t) => {
+  const f = fixture(t);
+  f.model.paths.set(1, "package.json");
+  // A person takes 16 seconds (over the 15-second budget) to read the prompt and type yes.
+  const slow = { numbers: [1], confirm: () => { f.model.mono += 16_000; return true; } };
+  const done = value(await f.client.approve(slow));
+  assert.equal(done.approvals[0].number, 1);
+  assert.equal(readFileSync(join(f.dir, "conveyor-approvals.log"), "utf8").trim().split("\n").length, 1);
+});
+
+test("approve still reports a head that moved during a slow confirm", async (t) => {
+  const f = fixture(t);
+  f.model.paths.set(1, "package.json");
+  const moved = await f.client.approve({ numbers: [1], confirm: () => { f.model.mono += 16_000; f.model.prs[0] = pull(1, HEAD2); return true; } });
+  assert.equal(moved.error.code, "stale_head");
+  assert.throws(() => readFileSync(join(f.dir, "conveyor-approvals.log")), { code: "ENOENT" });
+});
+
+test("approve refuses when the held classes changed under the same head", async (t) => {
+  const f = fixture(t);
+  f.model.paths.set(1, "package.json");
+  const moved = await f.client.approve({ numbers: [1], confirm: () => { f.model.paths.set(1, ".github/workflows/ci.yml"); return true; } });
+  assert.equal(moved.error.code, "stale_head");
+});
+
+test("approve's read phases are bounded on their own, so a batch of PRs fits", async (t) => {
+  const f = fixture(t);
+  const count = 20;
+  f.model.prs = Array.from({ length: count }, (_, index) => pull(index + 1));
+  for (let number = 1; number <= count; number += 1) f.model.paths.set(number, "package.json");
+  const before = () => f.model.calls.length;
+  const start = before();
+  const done = value(await f.client.approve({ numbers: f.model.prs.map((pr) => pr.number), confirm: () => true }));
+  assert.equal(done.approvals.length, count);
+  assert.ok(before() - start > 160, "two phases together exceed one phase's command cap");
+});
+
+test("approve records the digest and one record per held class", async (t) => {
+  const f = fixture(t);
+  f.model.paths.set(1, "package.json");
+  value(await f.client.approve({ numbers: [1], confirm: () => true }));
+  const [record] = readFileSync(join(f.dir, "conveyor-approvals.log"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  assert.match(record.digest, /^[0-9a-f]{64}$/u);
+  assert.equal(record.head, HEAD);
+  // Two classes at once: package.json (dependencies) and a workflow (CI).
+  const g = fixture(t);
+  g.model.paths.set(1, "package.json");
+  g.model.prs[0].changedFiles = 2;
+  g.model.override = (argv) => {
+    if (argv[2]?.includes("/compare/") && argv[2].includes("per_page=1&page=1")) {
+      const [, base, head] = /compare\/(\w+)\.\.\.(\w+)/.exec(argv[2]);
+      return ok({ base, files: ["package.json", ".github/workflows/ci.yml"].map((filename) => ({ filename, sha: MERGE, status: "modified",
+        contents_url: `https://api.github.com/repos/example/widgets/contents/file?ref=${head}` })) });
+    }
+    if (argv[2]?.includes("/git/trees/")) return ok([false, [["package.json", "100644"], [".github/workflows/ci.yml", "100755"]]]);
+    return undefined;
+  };
+  const multi = value(await g.client.approve({ numbers: [1], confirm: () => true }));
+  assert.equal(multi.approvals[0].classes.length, 2);
+  const records = readFileSync(join(g.dir, "conveyor-approvals.log"), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  assert.deepEqual(records.map((r) => r.scope).sort(), multi.approvals[0].classes.map((why) => `hold:${why}`).sort());
+  assert.equal(new Set(records.map((r) => r.digest)).size, 2);
+});
+
+test("approve refuses a pull request that targets another base", async (t) => {
+  const f = fixture(t);
+  f.model.paths.set(1, "package.json");
+  f.model.prs[0].baseRefName = "release";
+  const result = await f.client.approve({ numbers: [1], confirm: () => true });
+  assert.equal(result.error.code, "data_unavailable");
+  assert.match(result.error.message, /does not target main/u);
+});
+
+test("window without a configured publisher is refused before the confirm runs", async (t) => {
+  const f = fixture(t, { config: { clearancePublisherId: undefined } });
+  let asked = false;
+  const result = await f.client.window({ hours: 8, confirm: () => { asked = true; return true; } });
+  assert.equal(result.error.code, "invalid_config");
+  assert.equal(asked, false);
+});
+
+test("approve starts its record on a fresh line when the log lost its final newline", async (t) => {
+  const f = fixture(t);
+  f.model.paths.set(1, "package.json");
+  const log = join(f.dir, "conveyor-approvals.log");
+  writeFileSync(log, '{"pr":9,"scope":"merge"}');
+  value(await f.client.approve({ numbers: [1], confirm: () => true }));
+  const lines = readFileSync(log, "utf8").split("\n");
+  assert.equal(lines.length, 3);
+  assert.equal(JSON.parse(lines[0]).pr, 9);
+  assert.equal(JSON.parse(lines[1]).pr, 1);
+  assert.equal(lines[2], "");
+});
+
+const terminal = (isTTY, typedText) => {
+  const input = new PassThrough();
+  input.isTTY = isTTY;
+  input.setRawMode = () => input;
+  const chunks = [];
+  const output = new PassThrough();
+  output.isTTY = isTTY;
+  output.on("data", (chunk) => chunks.push(String(chunk)));
+  if (typedText !== undefined) input.end(typedText);
+  return { input, output, text: () => chunks.join("") };
+};
+
+test("typed refuses without a terminal, and accepts only the word yes", async () => {
+  const dumb = terminal(false, "yes\n");
+  assert.equal(await typed("Q: ", dumb), false);
+  assert.equal(dumb.text(), "");
+  const half = terminal(true, "yes\n");
+  half.output.isTTY = false;
+  assert.equal(await typed("Q: ", half), false);
+  for (const [text, expected] of [["yes\n", true], [" yes \n", true], ["Yes\n", false], ["y\n", false], ["yes please\n", false], ["\n", false]]) {
+    const tty = terminal(true, text);
+    assert.equal(await typed("Q: ", tty), expected, JSON.stringify(text));
+    assert.match(tty.text(), /Q: /u);
+  }
+});
+
+test("the default confirm prompts with sanitized, stderr-bound text under --json", async () => {
+  const shown = [];
+  const client = { window: async (input) => {
+    shown.push(await input.confirm({ hours: 2, repo: "example/widgets", base: "main\x1b]0;x\x07evil" }));
+    return { ok: true, value: { kind: "resumed", changed: true, consentUntil: "2026-01-02T00:00:00.000Z" } };
+  } };
+  const stdin = terminal(true, "yes\n").input;
+  let stdout = "";
+  const err = terminal(true);
+  const code = await runCli(["window", "on", "2", "--json"], { stdin, clientFactory: () => client,
+    stdout: { isTTY: true, columns: 80, write: (text) => { stdout += text; } }, stderr: err.output });
+  assert.equal(code, 0);
+  assert.deepEqual(shown, [true]);
+  assert.equal(JSON.parse(stdout).ok, true);
+  assert.equal(stdout.trimEnd().split("\n").length, 1);
+  assert.match(err.text(), /merge into main \]0;x evil of example\/widgets/u);
+  assert.doesNotMatch(err.text(), /\x07|\x1b\]/u);
+  // Without --json the prompt goes to stdout.
+  const plain = terminal(true);
+  await runCli(["window", "on", "2"], { stdin: terminal(true, "yes\n").input, clientFactory: () => client, stdout: Object.assign(plain.output, { columns: 80 }), stderr: terminal(true).output });
+  assert.match(plain.text(), /Type "yes"/u);
+  // makeConfirm builds the same prompt for approve.
+  const approve = terminal(true);
+  assert.equal(await makeConfirm({ input: terminal(true, "yes\n").input, output: approve.output }).approve({ approvals: [{ number: 3, headSha: HEAD, classes: ["CI"] }], hours: 24 }), true);
+  assert.match(approve.text(), /#3 at b{12}: CI/u);
 });

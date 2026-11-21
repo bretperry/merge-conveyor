@@ -102,6 +102,11 @@ export interface Consent {
   consentUntil: string | null;
 }
 
+export interface Approvals {
+  approvals: { number: number; headSha: string; classes: string[] }[];
+  expires: string;
+}
+
 export interface ConveyorConfig {
   repo?: string;
   base?: string;
@@ -125,6 +130,18 @@ export interface ClientOptions {
   notify?: (input: { repo: string; base: string; message: string }) => void;
 }
 
+export interface WorkerEvent {
+  schemaVersion: 1;
+  at: string;
+  type: "tick_started" | "intent_journaled" | "tick_finished" | (string & {});
+  action?: Action;
+  baseSha?: string;
+  outcome?: "merged" | "updated" | "idle" | "blocked" | "unknown" | "error";
+  commands?: number;
+  code?: string;
+  result?: RecordedAction;
+}
+
 export interface Client {
   queue(): Promise<Result<QueueSnapshot>>;
   preview(): Promise<Result<QueueSnapshot>>;
@@ -133,9 +150,18 @@ export interface Client {
   status(): Promise<Result<WorkerStatus>>;
   doctor(): Promise<Result<Diagnostics>>;
   report(input?: { days?: number }): Promise<Result<MergeReport>>;
+  /** Read-only: the event feed path and its newest events (default 200; 0 returns only the path). */
+  events(input?: { limit?: number }): Promise<Result<{ path: string; events: WorkerEvent[] }>>;
   clear(input: { number: number; headSha: string }): Promise<Result<Clearance>>;
   pause(): Promise<Result<Consent>>;
   resume(): Promise<Result<Consent>>;
+  /**
+   * `hours` 1–168 opens an expiring window after `confirm` resolves to exactly true (the CLI supplies one that needs a typed yes at a terminal; a library caller's own function is trusted as given);
+   * "off" pauses and needs no confirm.
+   */
+  window(input: { hours: number | "off"; confirm?: (input: { hours: number; repo: string; base: string }) => boolean | Promise<boolean> }): Promise<Result<Consent>>;
+  /** Records a 24-hour yes for every held class each pull request touches, after `confirm` resolves to exactly true. */
+  approve(input: { numbers: number[]; confirm?: (input: { approvals: Approvals["approvals"]; hours: number }) => boolean | Promise<boolean> }): Promise<Result<Approvals>>;
 }
 
 export declare function createClient(options?: ClientOptions): Client;
@@ -152,9 +178,13 @@ export interface LegacyConveyorConfig {
   switchVariable: string;
   clearedContext: string;
   stateName: string;
+  /** Older state-file stems, read when `stateName`'s file is missing; writes go to `stateName`. */
+  stateAliases?: string[];
   ageAlarms: { pokeHours: number; tellHours: number };
   mergeMethod?: ConveyorConfig["mergeMethod"];
   autoUpdate?: boolean;
+  /** Opt in: a `merge` approval at a PR's exact head merges it with the window off. Default false. The `commando` adapter must honor its `consent` option. */
+  mergeApprovals?: boolean;
   clearancePublisherId?: number;
   adapters: Record<
     "approved" | "changeDigest" | "gitDir" | "heldDigest" | "readHeld" | "activeUntil" | "commando" |
@@ -201,3 +231,27 @@ export interface LegacyConveyor {
 }
 
 export declare function createConveyor(config: LegacyConveyorConfig): LegacyConveyor;
+
+type HoldPattern = [RegExp, string];
+
+export declare const MAX_PR_FILES: number;
+export declare const BASE_HOLDS: HoldPattern[];
+export declare const PACKAGE_HOLDS: HoldPattern[];
+export declare const LANGUAGE_HOLDS: HoldPattern[];
+export declare function createHolds(patterns: HoldPattern[]): { heldBy(paths: string[]): string[]; pathsHeld(paths: string[], why: string): string[] };
+
+export declare function createApprovals(options: {
+  HOLD_PATTERNS: HoldPattern[];
+  MAX_PR_FILES: number;
+  heldBy: (paths: string[]) => string[];
+  pathsHeld: (paths: string[], why: string) => string[];
+  /** The log written in the git common dir. Default `conveyor-approvals.log`. */
+  approvalsLog?: string;
+  /** Older log names, read as well, so a yes recorded under one still counts. */
+  approvalsLogAliases?: string[];
+  boundedReads?: boolean;
+}): Record<string, any>;
+
+export declare function createMerge(options: { loadHeavyChecks: LegacyAdapter; isGateContext: (context: string) => boolean; base?: string; releaseBranch?: string; mergeMethod?: ConveyorConfig["mergeMethod"] }): Record<string, any>;
+
+export declare function ciVerdict(rollup: unknown): "red" | "pending" | "green" | "unknown" | null;
