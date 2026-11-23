@@ -17,7 +17,7 @@ const status = { __typename: "StatusContext", context: "outside", state: "SUCCES
 const rule = { type: "required_status_checks", parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: "outside", integration_id: 12 }] } };
 const result = (value, code = 0) => ({ status: code, stdout: typeof value === "string" ? value : JSON.stringify(value), stderr: "" });
 
-const fixture = ({ batch = false } = {}) => {
+const fixture = ({ batch = false, bases = { base: "integration", releaseBranch: "release" } } = {}) => {
   const pr = {
     number: 7, state: "OPEN", headRefOid: HEAD, baseRefName: "integration", baseRefOid: BASE,
     isDraft: false, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", statusCheckRollup: [check, status],
@@ -28,8 +28,9 @@ const fixture = ({ batch = false } = {}) => {
     pr, second, rules: [rule], writes: [], out: [], views: 0, confirms: true,
     comparison: { status: "ahead", behind_by: 0, files: [{ filename: "src/example.mjs" }] },
   };
-  const merge = createMerge({ base: "integration", releaseBranch: "release", loadHeavyChecks: async () => [{ name: "Build", classify: (paths) => paths.some((path) => path.startsWith("src/")) }], isGateContext: (name) => name.startsWith("gate/") });
+  const merge = createMerge({ ...bases, loadHeavyChecks: async () => [{ name: "Build", classify: (paths) => paths.some((path) => path.startsWith("src/")) }], isGateContext: (name) => name.startsWith("gate/") });
   const run = (argv) => {
+    if (argv[1] === "pr" && argv[2] === "checks" && argv.includes("--required")) return result(model.required ?? []);
     if (argv[1] === "pr" && argv[2] === "view") {
       model.views += 1;
       return result(prs.get(Number(argv[3])));
@@ -54,6 +55,7 @@ const fixture = ({ batch = false } = {}) => {
   let time = 0;
   return {
     model,
+    elapsed: () => time,
     start: (opts = {}, args = []) => merge.main([...prs.keys()].map(String).concat("--wait-minutes", "0.05", "--poll-seconds", "1", ...args), {
       run, clock: () => time, sleep: async (seconds) => { time += seconds; }, out: (line) => model.out.push(line), err: (line) => model.out.push(line), ...opts,
     }),
@@ -185,4 +187,157 @@ test("CI rollups keep provider types separate and fail closed on unknown outcome
   const sameName = { ...check, name: status.context };
   assert.equal(checkRows([status, sameName]).length, 2);
   assert.equal(ciVerdict(checkRows([sameName, { ...sameName, conclusion: "FAILURE" }])), "red");
+});
+
+// The pre-0.2 cases, kept as they were.
+test("lenient ciVerdict keeps the pre-0.2 reading; the default is unchanged", () => {
+  const lenient = (rollup) => ciVerdict(rollup, { lenient: true });
+  assert.equal(lenient([]), null);
+  assert.equal(lenient([{ status: "COMPLETED", conclusion: "SUCCESS" }, { status: "COMPLETED", conclusion: "SKIPPED" }]), "green");
+  assert.equal(lenient([{ status: "IN_PROGRESS", conclusion: "" }, { status: "COMPLETED", conclusion: "SUCCESS" }]), "pending");
+  assert.equal(lenient([{ status: "IN_PROGRESS", conclusion: "" }, { status: "COMPLETED", conclusion: "FAILURE" }]), "red");
+  assert.equal(lenient([{ state: "PENDING" }]), "pending");
+  assert.equal(lenient([{ state: "ERROR" }]), "red");
+  // Where the readings differ: a STALE or unknown completed outcome, and a queued run.
+  assert.equal(lenient([{ ...check, conclusion: "STALE" }]), "green");
+  assert.equal(ciVerdict([{ ...check, conclusion: "STALE" }]), "red");
+  assert.equal(lenient([{ ...check, conclusion: "OTHER" }]), "green");
+  assert.equal(ciVerdict([{ ...check, conclusion: "OTHER" }]), "unknown");
+  assert.equal(lenient([{ ...check, status: "QUEUED", conclusion: "" }]), "pending");
+  assert.equal(lenient("not a rollup"), "unknown");
+  // A caller passing ciVerdict to map() hands it an index, which is not the option.
+  assert.deepEqual([[{ ...check, conclusion: "OTHER" }]].map(ciVerdict), ["unknown"]);
+});
+
+const HEAVY = async () => [{ name: "Build", classify: (paths) => paths.some((path) => path.startsWith("src/")) }];
+
+test("createMerge takes the pre-0.2 base names too, and refuses two that disagree", async () => {
+  const f = fixture({ bases: { BASE_BRANCH: "integration", SHIP_BASE_BRANCH: "release" } });
+  assert.equal(await f.start(), 0);
+  assert.equal(f.model.writes.length, 1);
+  assert.equal(await fixture({ bases: { base: "integration", BASE_BRANCH: "integration", releaseBranch: "release", SHIP_BASE_BRANCH: "release" } }).start(), 0);
+  assert.throws(() => createMerge({ loadHeavyChecks: HEAVY, isGateContext: () => false, base: "dev", BASE_BRANCH: "main" }), /disagree/);
+  assert.throws(() => createMerge({ loadHeavyChecks: HEAVY, isGateContext: () => false, releaseBranch: "main", SHIP_BASE_BRANCH: "prod" }), /disagree/);
+});
+
+// The pre-0.2 --ship cases, with configured bases.
+test("--ship reaches only the release branch", async (t) => {
+  await t.test("refuses a PR based on the feature base", async () => {
+    const f = fixture();
+    assert.equal(await f.start({}, ["--ship"]), 1);
+    assert.deepEqual(f.model.writes, []);
+    assert.match(f.model.out.join("\n"), /refusing/);
+  });
+  await t.test("merges a release-based PR and says it deploys", async () => {
+    const f = fixture();
+    f.model.pr.baseRefName = "release";
+    assert.equal(await f.start({}, ["--ship"]), 0, f.model.out.join("\n"));
+    assert.equal(f.model.writes.length, 1);
+    assert.match(f.model.out.join("\n"), /SHIP: merging #7 into release deploys production immediately/);
+  });
+  await t.test("the same with the pre-0.2 names", async () => {
+    const f = fixture({ bases: { BASE_BRANCH: "integration", SHIP_BASE_BRANCH: "release" } });
+    f.model.pr.baseRefName = "release";
+    assert.equal(await f.start({}, ["--ship"]), 0);
+  });
+  await t.test("takes exactly one PR, never with --partial, and names the bases", async () => {
+    const f = fixture({ batch: true });
+    assert.equal(await f.start({}, ["--ship"]), 2);
+    assert.match(f.model.out.join("\n"), /--ship takes exactly one PR \(the integration -> release ship PR\)/);
+    assert.equal(await fixture().start({}, ["--ship", "--partial"]), 2);
+    assert.equal(f.model.views, 0);
+  });
+  await t.test("refuses a release branch that is unset or equals the base", async () => {
+    for (const bases of [{ base: "integration" }, { base: "integration", releaseBranch: "integration" }, { BASE_BRANCH: "integration", SHIP_BASE_BRANCH: "integration" }]) {
+      const f = fixture({ bases });
+      assert.equal(await f.start({}, ["--ship"]), 2);
+      assert.equal(f.model.views, 0);
+      assert.deepEqual(f.model.writes, []);
+    }
+  });
+});
+
+// The pre-0.2 earlyExit and wantHeads cases.
+test("wantHeads pins each PR to its own head and must cover every PR", async (t) => {
+  await t.test("both vetted heads merge, and onMerged hears each", async () => {
+    const f = fixture({ batch: true });
+    const merged = [];
+    assert.equal(await f.start({ wantHeads: new Map([[7, HEAD], [8, NEW_HEAD]]), onMerged: (n) => merged.push(n) }), 0);
+    assert.deepEqual(merged, [7, 8]);
+  });
+  await t.test("a PR past its vetted head merges none", async () => {
+    const f = fixture({ batch: true });
+    assert.equal(await f.start({ wantHeads: new Map([[7, HEAD], [8, "d".repeat(40)]]) }), 1);
+    assert.deepEqual(f.model.writes, []);
+    assert.match(f.model.out.join("\n"), /#8 NOT QUALIFIED: head moved/);
+  });
+  await t.test("one missing or short head is a usage error", async () => {
+    for (const wantHeads of [new Map(), new Map([[7, HEAD]]), new Map([[7, HEAD], [8, "abc"]]), { 7: HEAD, 8: NEW_HEAD }]) {
+      const f = fixture({ batch: true });
+      assert.equal(await f.start({ wantHeads }), 2);
+      assert.equal(f.model.views, 0);
+    }
+  });
+});
+
+test("earlyExit stops the wait at once on a conflict or a red required check", async (t) => {
+  await t.test("conflict", async () => {
+    const f = fixture({ batch: true });
+    f.model.second.mergeable = "CONFLICTING";
+    assert.equal(await f.start({ earlyExit: true }, ["--wait-minutes", "55"]), 1);
+    assert.deepEqual(f.model.writes, []);
+    assert.equal(f.elapsed(), 0);
+    assert.deepEqual(f.model.out.filter((line) => line.startsWith("stopped early")), ["stopped early: #8 merge conflict with integration; merged none"]);
+    assert.doesNotMatch(f.model.out.join("\n"), /NOT QUALIFIED/);
+  });
+  await t.test("red required check", async () => {
+    const f = fixture();
+    f.model.pr.statusCheckRollup = [{ ...check, conclusion: "FAILURE" }, status];
+    f.model.required = [{ name: "Build", bucket: "fail", workflow: "CI", startedAt: WHEN }];
+    assert.equal(await f.start({ earlyExit: true }, ["--wait-minutes", "55"]), 1);
+    assert.equal(f.elapsed(), 0);
+    assert.match(f.model.out.join("\n"), /stopped early: #7 required check failing: Build; merged none/);
+  });
+  await t.test("a red check that isn't required keeps waiting", async () => {
+    const f = fixture();
+    f.model.pr.statusCheckRollup = [{ ...check, conclusion: "FAILURE" }, status];
+    assert.equal(await f.start({ earlyExit: true }), 1);
+    assert.ok(f.elapsed() > 0);
+    assert.doesNotMatch(f.model.out.join("\n"), /stopped early/);
+  });
+  await t.test("without earlyExit a conflict still waits", async () => {
+    const f = fixture();
+    f.model.pr.mergeable = "CONFLICTING";
+    assert.equal(await f.start(), 1);
+    assert.ok(f.elapsed() > 0);
+  });
+});
+
+test("a throwing onMerged is reported, the batch goes on, and the exit is 1", async () => {
+  const f = fixture({ batch: true });
+  const heard = [];
+  const onMerged = (n) => {
+    heard.push(n);
+    if (n === 7) throw new Error("ledger full");
+  };
+  assert.equal(await f.start({ onMerged }), 1);
+  assert.deepEqual(f.model.writes.map((argv) => argv[6]), [`sha=${HEAD}`, `sha=${NEW_HEAD}`]);
+  assert.deepEqual(heard, [7, 8]);
+  assert.match(f.model.out.join("\n"), /#7 onMerged failed: ledger full/);
+  assert.equal(f.model.out.at(-1), "onMerged failed for #7; those PRs are merged");
+});
+
+test("an unconfirmed merge never calls onMerged", async () => {
+  const f = fixture({ batch: true });
+  f.model.confirms = false;
+  const heard = [];
+  assert.equal(await f.start({ onMerged: (n) => heard.push(n) }), 1);
+  assert.deepEqual(heard, []);
+});
+
+test("a batch that lands fewer than it named says so last", async () => {
+  const f = fixture({ batch: true });
+  f.model.afterMerge = () => { f.model.second.mergeStateStatus = "BLOCKED"; };
+  assert.equal(await f.start(), 1);
+  assert.equal(f.model.out.at(-1), "merged 1 of 2, skipped 1");
 });

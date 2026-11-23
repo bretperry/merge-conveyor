@@ -252,6 +252,39 @@ export declare function createApprovals(options: {
   boundedReads?: boolean;
 }): Record<string, any>;
 
-export declare function createMerge(options: { loadHeavyChecks: LegacyAdapter; isGateContext: (context: string) => boolean; base?: string; releaseBranch?: string; mergeMethod?: ConveyorConfig["mergeMethod"] }): Record<string, any>;
+/** Each path's git mode at the merge base of the PR's base and `head`, or null when any read fails. */
+export declare function mergeBaseModes(pr: string | number, head: string, files: Array<{ status: string; ref?: string }>, run: LegacyAdapter, base?: string): Map<string, string> | null;
 
-export declare function ciVerdict(rollup: unknown): "red" | "pending" | "green" | "unknown" | null;
+/** Options for a merge batch's `main(argv, options)`. */
+export interface MergeMainOptions {
+  root?: string;
+  run?: LegacyAdapter;
+  clock?: () => number;
+  sleep?: (seconds: number) => Promise<void>;
+  out?: (line: string) => void;
+  err?: (line: string) => void;
+  /** One PR only: merge only at this full head SHA. */
+  wantHead?: string;
+  /** PR number to the full head SHA it was vetted at. Given at all, it must cover every PR (an empty Map is refused). 0.2.1. */
+  wantHeads?: Map<number, string>;
+  /** Stop the wait at once, merging none, on a conflict or a red required check. 0.2.1. */
+  earlyExit?: boolean;
+  /** Called per confirmed merge; a throw is reported and makes the exit 1, and the batch goes on. 0.2.1. */
+  onMerged?: (pr: number) => void;
+  /** A non-empty reason skips that PR's merge. */
+  beforeMerge?: (pr: number) => string;
+  base?: string;
+  releaseBranch?: string;
+  mergeMethod?: ConveyorConfig["mergeMethod"];
+}
+
+/**
+ * `base`/`releaseBranch` and the pre-0.2 names `BASE_BRANCH`/`SHIP_BASE_BRANCH` are the same options; both
+ * given and different throws.
+ */
+export declare function createMerge(options: { loadHeavyChecks: LegacyAdapter; isGateContext: (context: string) => boolean; base?: string; releaseBranch?: string; BASE_BRANCH?: string; SHIP_BASE_BRANCH?: string; mergeMethod?: ConveyorConfig["mergeMethod"] }): Record<string, any> & {
+  main(argv: string[], options?: MergeMainOptions): Promise<0 | 1 | 2>;
+};
+
+/** `lenient: true` is the pre-0.2 reading: no "unknown" for an array, and STALE or an unknown completed outcome reads green. */
+export declare function ciVerdict(rollup: unknown, options?: { lenient?: boolean }): "red" | "pending" | "green" | "unknown" | null;

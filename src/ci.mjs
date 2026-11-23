@@ -4,11 +4,26 @@ import { latestPerCheck } from "./merge-checks.mjs";
 const RED = new Set(["FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE"]);
 const GREEN = new Set(["SUCCESS", "SKIPPED", "NEUTRAL"]);
 const PENDING = new Set(["PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", "REQUESTED", "WAITING", "PENDING_DEPLOYMENT"]);
+// The lenient reading's red: STALE is not in it.
+const LENIENT_RED = new Set(["FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"]);
+
+// The pre-0.2 reading: red if any row failed, pending if any is still running, else green. A completed
+// row with an outcome it doesn't know (STALE included) reads green, and it never says "unknown", so a
+// caller that merges on its green accepts those rows. The default reading refuses them.
+const lenientVerdict = (rollup) => {
+  // A check run carries status + conclusion; a commit status carries only state.
+  const outcomes = rollup.map((row) => row?.conclusion || row?.state || "");
+  if (outcomes.some((outcome) => LENIENT_RED.has(outcome))) return "red";
+  if (rollup.some((row) => (row?.status ? row.status !== "COMPLETED" : ["PENDING", "EXPECTED"].includes(row?.state)))) return "pending";
+  return "green";
+};
 
 // "unknown" never qualifies a head. Empty is distinct from both green and malformed.
-export const ciVerdict = (rollup = []) => {
+// `{ lenient: true }` gives the pre-0.2 reading above; a non-array is still "unknown" there.
+export const ciVerdict = (rollup = [], { lenient = false } = {}) => {
   if (!Array.isArray(rollup)) return "unknown";
   if (rollup.length === 0) return null;
+  if (lenient) return lenientVerdict(rollup);
   const outcomes = rollup.map((row) => {
     if (row?.status === "COMPLETED") return row.conclusion;
     if (row?.status) return PENDING.has(row.status) ? row.status : undefined;

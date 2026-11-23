@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.1 (unreleased)
+
+- `createApprovals`: file records carry `additions`, `deletions` and `hasPatch`; with `allModes`, old-side files carry `previousMode` from the merge base; `mergeBaseModes` reads it on its own.
+- `createApprovals`: a `revoke: true` record voids every grant for its PR and scope written before it (a missing `at` voids too, and its expiry is ignored), and is never read as a grant. `mergeBaseModes` is exported from the package root.
+- `ciVerdict(rollup, { lenient: true })` keeps the pre-0.2 reading (STALE and unknown outcomes read green, no `unknown`). Without the option nothing changes.
+- `createMerge` also takes `BASE_BRANCH` and `SHIP_BASE_BRANCH`; `--ship` refuses a release branch equal to the base; `main` takes `wantHeads`, `earlyExit` and `onMerged`.
+
 ## 0.2.0 (unreleased)
 
 - Embedded mode: `conveyor --config <module.mjs> <command>` runs a project's own config module, adapters included, through the line CLI (`tick`, `status`, `report`, `clear`).
