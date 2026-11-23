@@ -1,6 +1,6 @@
 {
   "name": "merge-conveyor",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "An unattended merge timer for GitHub repos: merges cleared, tested PRs one at a time.",
   "type": "module",
   "engines": {

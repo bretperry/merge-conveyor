@@ -1,6 +1,6 @@
 // Approval records, held-file reads and content fingerprints.
 // Used by: the conveyor config and the package tests.
-// Exports: createApprovals.
+// Exports: createApprovals, mergeBaseModes.
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { basename, isAbsolute, join } from "node:path";
@@ -31,6 +31,28 @@ const treeModes = (head, run) => {
   }
 };
 
+// A file with an old side at the base whose mode counts: a removed file, a type change (`changed`), or
+// a rename's or copy's old path.
+const old = (file) => file.status === "removed" || file.status === "changed" || Boolean(file.previous);
+
+// Each path's git mode at the commit a PR's files are diffed from: the merge base of its base branch and
+// `head`, where a removed file's contents_url points. `base` is the base tip already read, if any; without
+// it the PR's is read. Null when any read fails, or when a removed entry was listed at another commit (the
+// base it names isn't the one read).
+export const mergeBaseModes = (pr, head, files, run, base) => {
+  if (base === undefined) {
+    const view = run(["gh", "pr", "view", String(pr), "--json", "baseRefOid"]);
+    if (view.status !== 0) return null;
+    base = parseJson(view.stdout)?.baseRefOid;
+  }
+  if (!isSha(base) || !isSha(head)) return null;
+  const compare = run(["gh", "api", `repos/{owner}/{repo}/compare/${base}...${head}`, "--jq", ".merge_base_commit.sha"]);
+  const mergeBase = compare.status === 0 ? compare.stdout.trim() : "";
+  if (!isSha(mergeBase)) return null;
+  if (files.some((file) => file.status === "removed" && file.ref !== mergeBase)) return null;
+  return treeModes(mergeBase, run);
+};
+
 // Every path a file list touches, a rename's old path too: moving a held file away changes that file.
 const filePaths = (files) => files.flatMap((file) => (file.previous ? [file.path, file.previous] : [file.path]));
 
@@ -59,16 +81,18 @@ const headOf = (pr, run, includeFiles = false) => {
 };
 
 // A PR's changed files from GitHub's files API: each one's path, status, blob id, a rename's old
-// path, and the commit its contents_url names (`ref`). Null when GitHub won't give the list, or a line
-// of it isn't a file entry: no list, no digest.
+// path, the commit its contents_url names (`ref`), its added and deleted line counts as listed, and
+// whether it has a patch (GitHub leaves it out for a binary, an empty file, a pure rename, and a text
+// diff too large to show). Null when GitHub won't give the list, or a line of it isn't a file entry:
+// no list, no digest. Counts are passed through unchecked; a caller's rule checks them.
 const prFiles = (pr, run) => {
-  const result = run(["gh", "api", "--paginate", `repos/{owner}/{repo}/pulls/${pr}/files`, "--jq", '.[] | [.filename, .status, .sha, (.previous_filename // ""), (.contents_url // "")] | @json']);
+  const result = run(["gh", "api", "--paginate", `repos/{owner}/{repo}/pulls/${pr}/files`, "--jq", '.[] | [.filename, .status, .sha, (.previous_filename // ""), (.contents_url // ""), .additions, .deletions, ((.patch // "") != "")] | @json']);
   if (result.status !== 0) return null;
   try {
     return result.stdout.split("\n").filter(Boolean).map((line) => {
-      const [path, status, sha, previous, url] = JSON.parse(line);
+      const [path, status, sha, previous, url, additions, deletions, hasPatch] = JSON.parse(line);
       if (typeof path !== "string") throw new Error("not a file entry");
-      return { path, status, sha, previous, ref: listedAt(url) };
+      return { path, status, sha, previous, ref: listedAt(url), additions, deletions, hasPatch: hasPatch === true };
     });
   } catch {
     return null;
@@ -80,7 +104,7 @@ const prFiles = (pr, run) => {
 const MAX_COMPARE_FILES = 300;
 const pinnedFiles = ({ base, head, changedFiles }, run) => {
   const response = run(["gh", "api", `repos/{owner}/{repo}/compare/${base}...${head}?per_page=1&page=1`, "--jq",
-    "{base: .base_commit.sha, files: [.files[] | {filename, status, sha, previous_filename, contents_url}]}"]);
+    "{base: .base_commit.sha, files: [.files[] | {filename, status, sha, previous_filename, contents_url, additions, deletions, hasPatch: ((.patch // \"\") != \"\")}]}"]);
   const result = response.status === 0 ? parseJson(response.stdout) : null;
   if (result?.base !== base || !Array.isArray(result.files) || result.files.length !== changedFiles) return null;
   const files = [];
@@ -88,9 +112,19 @@ const pinnedFiles = ({ base, head, changedFiles }, run) => {
     if (typeof row?.filename !== "string" || !row.filename || !isSha(row.sha) ||
       !["added", "removed", "modified", "renamed", "copied", "changed", "unchanged"].includes(row.status) ||
       (row.status === "renamed" && (typeof row.previous_filename !== "string" || !row.previous_filename))) return null;
-    files.push({ path: row.filename, status: row.status, sha: row.sha, previous: row.previous_filename ?? "", ref: listedAt(row.contents_url) });
+    files.push({ path: row.filename, status: row.status, sha: row.sha, previous: row.previous_filename ?? "", ref: listedAt(row.contents_url), additions: row.additions, deletions: row.deletions, hasPatch: row.hasPatch === true });
   }
   return new Set(files.map((file) => file.path)).size === files.length ? files : null;
+};
+
+// Whether a revoke voids a grant: same PR (by number) and scope, at any head, since a grant can also match by
+// digest at another head. Written at or before the revoke; a missing or unparseable `at` on either side voids
+// it too, so a kill switch fails closed.
+const voids = (revoke, grant) => {
+  if (Number(revoke.pr) !== Number(grant.pr) || revoke.scope !== grant.scope) return false;
+  const revokedAt = Date.parse(revoke.at);
+  const grantedAt = Date.parse(grant.at);
+  return Number.isNaN(revokedAt) || Number.isNaN(grantedAt) || revokedAt >= grantedAt;
 };
 
 export const createApprovals = ({ HOLD_PATTERNS, MAX_PR_FILES, heldBy, pathsHeld, approvalsLog = "conveyor-approvals.log", approvalsLogAliases = [], boundedReads = false }) => {
@@ -110,20 +144,27 @@ export const createApprovals = ({ HOLD_PATTERNS, MAX_PR_FILES, heldBy, pathsHeld
 
   // The records still in force: written, not expired, and not more than the cap ahead (a hand-edited
   // expiry reads as void). Unparseable lines are skipped.
+  // A `revoke: true` record voids every grant for its PR and scope written at or before it (`voids` above),
+  // whatever its `expires`, and is never a grant itself: a host writes one to stop an approval already written.
   const activeApprovals = (dir, now) => {
     const paths = [APPROVALS_LOG, ...approvalsLogAliases].map((name) => join(dir, name)).filter((path) => existsSync(path));
     const latest = now.getTime() + APPROVAL_HOURS * 3600 * 1000;
-    return paths
+    const records = paths
       .flatMap((path) => readFileSync(path, "utf8").split("\n"))
       .flatMap((line) => {
         try {
           const record = JSON.parse(line);
-          const until = new Date(record.expires).getTime();
-          return until > now.getTime() && until <= latest && validScope(record.scope) ? [record] : [];
+          return record !== null && typeof record === "object" ? [record] : [];
         } catch {
           return [];
         }
       });
+    const revokes = records.filter((record) => record.revoke === true);
+    const inForce = (record) => {
+      const until = new Date(record.expires).getTime();
+      return until > now.getTime() && until <= latest && validScope(record.scope);
+    };
+    return records.filter((record) => record.revoke !== true && inForce(record) && !revokes.some((revoke) => voids(revoke, record)));
   };
 
 
@@ -171,9 +212,14 @@ export const createApprovals = ({ HOLD_PATTERNS, MAX_PR_FILES, heldBy, pathsHeld
     const paths = filePaths(files);
     if (!allModes && heldBy(paths).length === 0) return { head: before.head, files, paths };
     const modes = treeModes(before.head, run);
-    return { head: before.head, files: files.map((file) => ({ ...file, mode: modes?.get(file.path) })), paths };
+    const withModes = files.map((file) => ({ ...file, mode: modes?.get(file.path) }));
+    if (!allModes) return { head: before.head, files: withModes, paths };
+    // The old side's mode too (`previousMode`), for a removed file, a type change, and a rename's or copy's
+    // old path. Left undefined when it can't be read: a caller's rule must read that as unknown.
+    const baseModes = files.some(old) ? mergeBaseModes(pr, before.head, files, run, boundedReads ? before.base : undefined) : null;
+    return { head: before.head, files: withModes.map((file) => (old(file) ? { ...file, previousMode: baseModes?.get(file.previous || file.path) } : file)), paths };
   };
 
 
-  return { APPROVAL_HOURS, APPROVALS_LOG, HOLD_CLASSES, validScope, gitDir, activeApprovals, prFiles, filePaths, heldDigest, changeDigest, approved, headOf, readHeld };
+  return { APPROVAL_HOURS, APPROVALS_LOG, HOLD_CLASSES, validScope, gitDir, activeApprovals, prFiles, filePaths, heldDigest, changeDigest, approved, headOf, readHeld, mergeBaseModes };
 };

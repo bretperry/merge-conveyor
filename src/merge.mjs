@@ -77,7 +77,16 @@ const verdict = (snap, heavy) => {
   return reasons;
 };
 
-export const createMerge = ({ loadHeavyChecks, isGateContext, base, releaseBranch, mergeMethod = "merge" }) => {
+// One base option under either name: the 0.2.0 name or the pre-0.2 knob name (BASE_BRANCH, SHIP_BASE_BRANCH).
+// Both given and different is a config mistake, not a choice.
+const eitherName = (value, alias, names) => {
+  if (value !== undefined && alias !== undefined && value !== alias) throw new TypeError(`createMerge: ${names} disagree`);
+  return value ?? alias;
+};
+
+export const createMerge = ({ loadHeavyChecks, isGateContext, base: baseOption, releaseBranch: releaseOption, BASE_BRANCH, SHIP_BASE_BRANCH, mergeMethod = "merge" }) => {
+  const base = eitherName(baseOption, BASE_BRANCH, "base and BASE_BRANCH");
+  const releaseBranch = eitherName(releaseOption, SHIP_BASE_BRANCH, "releaseBranch and SHIP_BASE_BRANCH");
   const STABLE_POLLS = 3;
   const DEFAULT_WAIT_MINUTES = 55;
   const DEFAULT_POLL_SECONDS = 30;
@@ -104,9 +113,29 @@ export const createMerge = ({ loadHeavyChecks, isGateContext, base, releaseBranc
 
   // Polls a set of PRs until each has been ready for STABLE_POLLS polls, then merges them.
   class Batch {
-    constructor(numbers, { checks, run, clock = () => performance.now() / 1000, sleep = (s) => new Promise((done) => setTimeout(done, s * 1000)), out = console.log, ship, wantBase, wantHead, method, beforeMerge = () => "" }) {
-      Object.assign(this, { numbers, checks, run, clock, sleep, out, ship, wantBase, wantHead, method, beforeMerge });
+    constructor(numbers, { checks, run, clock = () => performance.now() / 1000, sleep = (s) => new Promise((done) => setTimeout(done, s * 1000)), out = console.log, ship, wantBase, wantHead, wantHeads = new Map(), earlyExit = false, method, beforeMerge = () => "", onMerged = () => {} }) {
+      Object.assign(this, { numbers, checks, run, clock, sleep, out, ship, wantBase, wantHead, wantHeads, earlyExit, method, beforeMerge, onMerged });
       this.heavyCache = new Map();
+      this.callbackErrors = [];
+    }
+
+    // The head this PR was vetted at: its own from wantHeads, else the one wantHead.
+    headFor(number) {
+      return this.wantHeads.get(number) ?? this.wantHead;
+    }
+
+    // Why waiting on this PR is pointless (earlyExit only): it conflicts, or a required check is red. "" when
+    // it might still come good. A red check that isn't required keeps the wait going. It only ever stops a
+    // wait early; it never qualifies a PR.
+    stopReason(snap, why) {
+      if (snap.error || terminal(snap)) return "";
+      if (snap.mergeable === "CONFLICTING") return `merge conflict with ${snap.wantBase}`;
+      if (!why.some((line) => line.startsWith("failing:"))) return "";
+      const required = this.run(["gh", "pr", "checks", String(snap.number), "--required", "--json", "name,bucket,state,workflow,startedAt"]);
+      const rows = required.stdout.trim() ? parseJson(required.stdout) : [];
+      if (!Array.isArray(rows)) return "";
+      const red = latestPerCheck(rows).filter((row) => !["pass", "skipping", "pending"].includes(row.bucket ?? "")).map((row) => row.name ?? "?").toSorted((a, b) => a.localeCompare(b));
+      return red.length > 0 ? `required check failing: ${red.join(", ")}` : "";
     }
 
     // The ship asks for every heavy check. Otherwise cache by both refs, which determine the diff.
@@ -118,7 +147,7 @@ export const createMerge = ({ loadHeavyChecks, isGateContext, base, releaseBranc
     }
 
     check(number) {
-      const snap = fetchPr(number, this.run, this.wantBase, this.wantHead);
+      const snap = fetchPr(number, this.run, this.wantBase, this.headFor(number));
       const heavy = snap.error || terminal(snap) ? [] : this.heavyFor(snap);
       return { snap, heavy, reasons: verdict(snap, heavy) };
     }
@@ -143,11 +172,17 @@ export const createMerge = ({ loadHeavyChecks, isGateContext, base, releaseBranc
       const reasons = new Map();
       const dead = new Set();
       const lastLine = new Map();
+      let stopped = null;
       for (;;) {
         for (const n of this.numbers) {
           if (pinned.has(n) || dead.has(n)) continue;
           const { snap, heavy, reasons: why } = this.check(n);
           if (terminal(snap)) dead.add(n);
+          const stop = this.earlyExit && why.length > 0 ? this.stopReason(snap, why) : "";
+          if (stop) {
+            stopped ??= { number: n, why: stop };
+            dead.add(n);
+          }
           const refs = `${snap.head}:${snap.baseSha}`;
           let line;
           if (why.length > 0) {
@@ -179,7 +214,7 @@ export const createMerge = ({ loadHeavyChecks, isGateContext, base, releaseBranc
         await this.sleep(pollSeconds);
       }
       const unqualified = new Map(this.numbers.filter((n) => !pinned.has(n)).map((n) => [n, reasons.get(n) ?? ["never checked"]]));
-      return { pinned, unqualified };
+      return { pinned, unqualified, stopped };
     }
 
     // Merges each pinned PR in input order after a fresh check. Returns the merged numbers.
@@ -209,7 +244,7 @@ export const createMerge = ({ loadHeavyChecks, isGateContext, base, releaseBranc
           continue;
         }
         const heavy = comparison ? requiredHeavy(comparison.paths, this.checks) : this.heavyFor({ number: n, head, baseSha });
-        const snap = fetchPr(n, this.run, this.wantBase, this.wantHead);
+        const snap = fetchPr(n, this.run, this.wantBase, this.headFor(n));
         const why = verdict(snap, heavy);
         if (!snap.error && snap.head !== head) why.unshift(`head changed ${short(head)} -> ${short(snap.head)}`);
         if (!snap.error && snap.baseSha !== expectedBase) why.unshift(`base tip changed ${short(expectedBase)} -> ${short(snap.baseSha)}`);
@@ -220,11 +255,20 @@ export const createMerge = ({ loadHeavyChecks, isGateContext, base, releaseBranc
         const write = mergePull(this.run, n, head, this.method);
         const outcome = readMerge(this.run, n);
         if (outcome?.state !== "MERGED" || outcome.headRefOid !== head || outcome.baseRefName !== this.wantBase) {
+          // No onMerged here: it reports landings, and this one isn't confirmed. The batch stops, so the host
+          // re-reads GitHub rather than trusting a guess either way.
           this.out(`#${n} MERGE UNCONFIRMED (state=${outcome?.state ?? "?"}, exit ${write.status})`);
           break;
         }
         this.out(`#${n} MERGED ${short(outcome.mergeCommit.oid)}`);
         merged.push(n);
+        // The merge already happened: a throwing callback is recorded and the batch goes on.
+        try {
+          this.onMerged(n);
+        } catch (error) {
+          this.callbackErrors.push(n);
+          this.out(`#${n} onMerged failed: ${error?.message ?? error}`);
+        }
         advance = { from: baseSha, to: outcome.mergeCommit.oid };
       }
       return merged;
@@ -261,7 +305,7 @@ export const createMerge = ({ loadHeavyChecks, isGateContext, base, releaseBranc
     const prs = [...new Set(positionals.map(Number))];
     // A ship is one PR by definition, and --partial means nothing with one. Refusing both keeps
     // --ship from ever reading as "merge whichever of these happens to be green".
-    if (values.ship && prs.length !== 1) return { error: "--ship takes exactly one PR" };
+    if (values.ship && prs.length !== 1) return { error: base && releaseBranch ? `--ship takes exactly one PR (the ${base} -> ${releaseBranch} ship PR)` : "--ship takes exactly one PR" };
     if (values.ship && values.partial) return { error: "--ship and --partial are contradictory" };
     return { prs, waitMinutes, pollSeconds, partial: values.partial, dryRun: values["dry-run"], ship: values.ship };
   };
@@ -269,7 +313,10 @@ export const createMerge = ({ loadHeavyChecks, isGateContext, base, releaseBranc
   // The whole run; returns the exit code (0 all merged or dry run, 1 something didn't, 2 usage).
   // `wantHead` (programmatic only, one PR): merge only if the PR's head is still that commit.
   // `beforeMerge` (programmatic only): called before each merge preflight; a non-empty reason skips it.
-  const main = async (argv, { root = process.cwd(), run = (argv) => defaultRun(argv, root), clock, sleep, out = console.log, err = console.error, wantHead = "", beforeMerge, base: featureBase = base, releaseBranch: shipBase = releaseBranch, mergeMethod: method = mergeMethod } = {}) => {
+  // `wantHeads` (programmatic only): a Map of PR number to the full SHA each was vetted at; covers every PR.
+  // `earlyExit` (programmatic only): stop the wait at once, with one line, when a PR conflicts or a required check is red.
+  // `onMerged` (programmatic only): called with each PR number as its merge is confirmed.
+  const main = async (argv, { root = process.cwd(), run = (argv) => defaultRun(argv, root), clock, sleep, out = console.log, err = console.error, wantHead = "", wantHeads, earlyExit = false, onMerged, beforeMerge, base: featureBase = base, releaseBranch: shipBase = releaseBranch, mergeMethod: method = mergeMethod } = {}) => {
     const args = parseCli(argv);
     if (args.error) {
       err(`${USAGE}\nwrangle-merge: ${args.error}`);
@@ -280,22 +327,43 @@ export const createMerge = ({ loadHeavyChecks, isGateContext, base, releaseBranc
       err("wrangle-merge: configure a target base and a supported merge method");
       return 2;
     }
+    // The ship guard: --ship reaches only the release branch, and only when it is a different branch from the
+    // feature base, so a typo in a list of PR numbers can never merge into what deploys.
+    if (args.ship && shipBase === featureBase) {
+      err(`wrangle-merge: --ship needs a release branch other than the feature base '${featureBase}'`);
+      return 2;
+    }
     if (wantHead && (args.prs.length !== 1 || !isSha(wantHead))) {
       err("wrangle-merge: wantHead must be the full SHA for exactly one PR");
       return 2;
     }
+    // Given at all, it pins every PR: an empty or partial Map would silently pin none or some.
+    if (wantHeads !== undefined && (!(wantHeads instanceof Map) || !args.prs.every((n) => isSha(wantHeads.get(n))))) {
+      err("wrangle-merge: wantHeads must name a full SHA for every PR");
+      return 2;
+    }
     const checks = await loadHeavyChecks(root);
-    const batch = new Batch(args.prs, { checks, run, clock, sleep, out, ship: args.ship, wantHead, wantBase, method, beforeMerge });
+    const batch = new Batch(args.prs, { checks, run, clock, sleep, out, ship: args.ship, wantBase, wantHead, wantHeads: wantHeads ?? new Map(), earlyExit, method, beforeMerge, onMerged });
     if (args.dryRun) return batch.dryRun();
     if (args.ship) out(`SHIP: merging #${args.prs[0]} into ${wantBase} deploys production immediately`);
     out(`batch ${args.prs.map((n) => `#${n}`).join(" ")}: ${args.partial ? "partial" : "all-or-nothing"}, wait up to ${args.waitMinutes} min`);
-    const { pinned, unqualified } = await batch.wait(args.waitMinutes * 60, args.pollSeconds, args.partial);
+    const { pinned, unqualified, stopped } = await batch.wait(args.waitMinutes * 60, args.pollSeconds, args.partial);
+    // Early exit: one line, the PR and why, and nothing merged (all-or-nothing) instead of a line per PR.
+    if (stopped && !args.partial) {
+      out(`stopped early: #${stopped.number} ${stopped.why}; merged none`);
+      return 1;
+    }
     for (const [n, why] of unqualified) out(`#${n} NOT QUALIFIED: ${why.join("; ")}`);
     if (unqualified.size > 0 && !args.partial) {
       out("all-or-nothing: merged none (rerun with --partial to merge the qualified ones)");
       return 1;
     }
-    return batch.merge(pinned).length === args.prs.length ? 0 : 1;
+    const merged = batch.merge(pinned);
+    // Say what landed: a PR can go bad between the wait and its turn, and the ones before it stay merged.
+    if (merged.length !== args.prs.length) out(`merged ${merged.length} of ${args.prs.length}, skipped ${args.prs.length - merged.length}`);
+    // A callback that threw lost the host's record of a landing: not a clean run, though the merges stand.
+    if (batch.callbackErrors.length > 0) out(`onMerged failed for ${batch.callbackErrors.map((n) => `#${n}`).join(" ")}; those PRs are merged`);
+    return merged.length === args.prs.length && batch.callbackErrors.length === 0 ? 0 : 1;
   };
 
 
